@@ -1,0 +1,79 @@
+# Binaries for programs and plugins
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+*.a
+
+# Test binary, built with `go test -c`
+*.test
+
+# Output of the go coverage tool
+*.out
+coverage.html
+coverage.txt
+
+# Go module cache
+/go.sum
+/vendor/
+
+# Build directories
+/build/
+/dist/
+/bin/
+
+# IDE specific files
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.vim/
+
+# OS specific
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Core submodule build artifacts
+core/build/
+core/cmake-build-*/
+
+# Temporary files
+*.tmp
+*.temp
+.tmp/
+temp/
+tmp/
+
+# Debug files
+*.pprof
+
+# Security
+.cursor/rules/snyk_rules.mdc
+
+# Documentation
+/docs/_build/
+/docs/generated/
+
+# Benchmark results
+benchmark-results/
+*.bench
+
+# Local configuration
+.env
+.env.local
+config.ini
+
+# Archives
+*.tar.gz
+*.zip
+
+# CGO generated files
+_cgo_*
+*.cgo1.go
+*.cgo2.c
+
+# Test coverage reports
+profile.cov
