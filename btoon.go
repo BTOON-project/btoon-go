@@ -1,197 +1,291 @@
-// Package btoon provides Go bindings for the BTOON binary serialization format.
 package btoon
 
-// #cgo CFLAGS: -I./core/include
-// #cgo LDFLAGS: -L./core/build -lbtoon_core -lz -lstdc++ -lm
-// #include <btoon/capi.h>
-// #include <stdlib.h>
-import "C"
 import (
-	"errors"
-	"fmt"
 	"reflect"
-	"unsafe"
+	"strconv"
 )
-
-// Version returns the BTOON library version
-const Version = "0.0.1"
-
-// Compression algorithms
-type CompressionAlgorithm int
 
 const (
-	CompressionNone CompressionAlgorithm = iota
-	CompressionZlib
-	CompressionLZ4
-	CompressionZSTD
-	CompressionBrotli
-	CompressionSnappy
+	// Version is the version of this library.
+	Version = "0.1.0"
+	// SpecVersion is the version of the BTOON specification it implements.
+	SpecVersion = "0.1"
 )
 
-// Options for encoding
+const (
+	// DefaultMaxDepth is the default nesting limit (SPEC §7).
+	DefaultMaxDepth = 128
+	// DefaultMaxDecompressedSize is the default limit for the uncompressed
+	// size of a compression envelope (SPEC §6): 256 MiB.
+	DefaultMaxDecompressedSize = 256 << 20
+	// maxMaxDepth keeps a caller-supplied MaxDepth from allowing recursion
+	// deep enough to exhaust the goroutine stack.
+	maxMaxDepth = 1 << 16
+)
+
+// EncodeOptions configure MarshalWithOptions. The zero value gives the
+// defaults of the cross-language API (SPEC-conformant canonical output).
 type EncodeOptions struct {
-	Compress     bool
-	Algorithm    CompressionAlgorithm
-	Level        int
-	AutoTabular  bool
+	// Compress wraps the document in a compression envelope (SPEC §6) using
+	// the Compression algorithm. Documents smaller than 256 bytes, and
+	// documents that the envelope would not shrink by at least 5%, are
+	// written uncompressed.
+	Compress bool
+	// Compression is the algorithm used when Compress is set. The zero value
+	// is Zlib. Other algorithms need a registered Codec; without one,
+	// MarshalWithOptions fails with CodeUnsupportedCompression.
+	Compression Compression
+	// CompressionLevel is passed to the codec; 0 selects its default.
+	CompressionLevel int
+	// DisableTabular turns off the columnar encoding of arrays of uniform
+	// maps (SPEC §5.6). It is the inverse of the cross-language
+	// auto_tabular option, so that the zero value is the default.
+	DisableTabular bool
+	// MaxDepth limits container nesting. 0 means DefaultMaxDepth. Deeper
+	// values and cyclic data structures fail with CodeMaxDepth.
+	MaxDepth int
+	// HMACKey, if not nil, signs the output with HMAC-SHA256 (SPEC §8). It
+	// must not be empty, and should be at least 32 random bytes.
+	HMACKey []byte
+	// PreserveTimeOffset writes a time.Time whose Location is not UTC with
+	// its UTC offset, using the 14-byte timestamp form. By default times are
+	// normalized to UTC, as SPEC §5.1 recommends.
+	PreserveTimeOffset bool
 }
 
-// Options for decoding
+// DecodeOptions configure DecodeWithOptions and UnmarshalWithOptions. The
+// zero value gives the defaults: strict mode, depth 128, 256 MiB envelope
+// limit, compression envelopes accepted.
 type DecodeOptions struct {
-	Decompress bool
+	// NonStrict selects SPEC §7 non-strict mode: trailing bytes are
+	// ignored, duplicate map keys are allowed (the last one wins) and UTF-8
+	// is not validated. Bounds, depth and allocation checks still apply.
+	NonStrict bool
+	// MaxDepth limits container nesting. 0 means DefaultMaxDepth.
+	MaxDepth int
+	// MaxDecompressedSize limits the uncompressed size of a compression
+	// envelope. 0 means DefaultMaxDecompressedSize.
+	MaxDecompressedSize int
+	// DisableDecompression rejects compression envelopes with
+	// CodeInvalidEnvelope (the cross-language auto_decompress = false).
+	DisableDecompression bool
+	// HMACKey, if not nil, requires a signed envelope (SPEC §8) and verifies
+	// its MAC before parsing. It must not be empty.
+	HMACKey []byte
+	// PreserveTimeTypes decodes timestamps, dates and datetimes as
+	// Timestamp, Date and DateTime instead of time.Time, so that they
+	// re-encode exactly (including the original extension type).
+	PreserveTimeTypes bool
+	// DisallowUnknownFields makes Unmarshal fail with CodeTypeMismatch when
+	// a map key has no matching field in the target struct.
+	DisallowUnknownFields bool
 }
 
-// Encode serializes a Go value to BTOON format
-func Encode(v interface{}, opts ...EncodeOptions) ([]byte, error) {
-	opt := EncodeOptions{
-		Compress:    false,
-		AutoTabular: true,
-		Level:       6,
-	}
-	if len(opts) > 0 {
-		opt = opts[0]
-	}
+// Marshal returns the canonical BTOON encoding of v (SPEC §4).
+//
+// Go values map to BTOON as follows:
+//
+//   - nil, nil pointers, nil interfaces, nil slices and nil maps: nil
+//   - bool: boolean
+//   - signed and unsigned integers: the smallest integer format for the
+//     value, regardless of the Go type
+//   - *big.Int and big.Int: an integer if it fits in [-2^63, 2^64-1],
+//     otherwise a bigint extension
+//   - float32 and float64: float64, with NaN canonicalized
+//   - string: string (it must be valid UTF-8)
+//   - []byte and [N]byte: binary
+//   - []float32 and [N]float32: float32 vector; VectorF64: float64 vector
+//   - other slices and arrays: array, or tabular when SPEC §5.6.2 says so
+//   - maps with string (or string-kind, or interface holding string) keys:
+//     map with keys in canonical order
+//   - structs: map of their exported fields (see below)
+//   - time.Time: timestamp in UTC (see EncodeOptions.PreserveTimeOffset)
+//   - Timestamp, Date, DateTime, Ext: the corresponding extension
+//   - types implementing encoding.BinaryMarshaler: binary
+//
+// Struct fields are encoded under their name, or the name given in a
+// `btoon:"name,omitempty"` tag. Without a btoon tag, the json tag is used.
+// A tag of "-" omits the field; the options omitempty and omitzero work as
+// in encoding/json, and embedded structs are flattened by the
+// encoding/json rules. Channels, functions and complex numbers are not
+// supported.
+func Marshal(v any) ([]byte, error) {
+	return MarshalWithOptions(v, EncodeOptions{})
+}
 
-	// Convert Go value to internal representation
-	data := encodeValue(v)
-	if data == nil {
-		return nil, errors.New("failed to encode value")
+// MarshalWithOptions is like Marshal but applies o, adding a compression
+// and/or signed envelope when requested (layered as
+// sign(compress(encode(v))), SPEC §8).
+func MarshalWithOptions(v any, o EncodeOptions) ([]byte, error) {
+	out, err := encodeBare(v, &o)
+	if err != nil {
+		return nil, err
 	}
-	defer freeEncodedData(data)
-
-	// Apply compression if requested
-	if opt.Compress {
-		data = compressData(data, opt.Algorithm, opt.Level)
-		if data == nil {
-			return nil, errors.New("compression failed")
+	if o.Compress {
+		if out, err = compressDocument(out, o.Compression, o.CompressionLevel); err != nil {
+			return nil, err
 		}
-		defer freeEncodedData(data)
 	}
-
-	// Convert to Go byte slice
-	return dataToBytes(data), nil
-}
-
-// Decode deserializes BTOON data to a Go value
-func Decode(data []byte, opts ...DecodeOptions) (interface{}, error) {
-	if len(data) == 0 {
-		return nil, errors.New("empty data")
-	}
-
-	opt := DecodeOptions{
-		Decompress: false,
-	}
-	if len(opts) > 0 {
-		opt = opts[0]
-	}
-
-	// Create C data structure
-	cdata := bytesToData(data)
-	if cdata == nil {
-		return nil, errors.New("failed to create data structure")
-	}
-	defer freeEncodedData(cdata)
-
-	// Apply decompression if requested
-	if opt.Decompress {
-		cdata = decompressData(cdata)
-		if cdata == nil {
-			return nil, errors.New("decompression failed")
+	if o.HMACKey != nil {
+		if len(o.HMACKey) == 0 {
+			return nil, newError(CodeInvalidArgument, "HMACKey is empty")
 		}
-		defer freeEncodedData(cdata)
+		out = signDocument(out, o.HMACKey)
 	}
-
-	// Decode to Go value
-	return decodeData(cdata)
+	return out, nil
 }
 
-// Helper functions for CGO interaction
-func encodeValue(v interface{}) unsafe.Pointer {
-	// Implementation would use reflection to convert Go types to C API calls
-	// This is a simplified placeholder
-	return nil
-}
-
-func decodeData(data unsafe.Pointer) (interface{}, error) {
-	// Implementation would decode C data to Go types
-	// This is a simplified placeholder
-	return nil, nil
-}
-
-func freeEncodedData(data unsafe.Pointer) {
-	if data != nil {
-		C.free(data)
+func encodeBare(v any, o *EncodeOptions) ([]byte, error) {
+	maxDepth, err := resolveMaxDepth(o.MaxDepth)
+	if err != nil {
+		return nil, err
 	}
+	e := encoder{
+		buf:        make([]byte, 0, 128),
+		maxDepth:   maxDepth,
+		noTabular:  o.DisableTabular,
+		keepOffset: o.PreserveTimeOffset,
+	}
+	if err := e.encode(reflect.ValueOf(v), 0); err != nil {
+		return nil, err
+	}
+	return e.buf, nil
 }
 
-func dataToBytes(data unsafe.Pointer) []byte {
-	// Convert C buffer to Go byte slice
-	// This is a simplified placeholder
-	return nil
+// Decode decodes a BTOON document, which may be wrapped in a compression
+// envelope, into a dynamic Go value:
+//
+//	nil                    nil
+//	boolean                bool
+//	integer                int64, or uint64 if above math.MaxInt64
+//	bigint extension       *big.Int
+//	float                  float64
+//	string                 string
+//	binary                 []byte
+//	array, tabular         []any
+//	map                    map[string]any
+//	timestamp              time.Time (UTC, or a fixed zone if it has an offset);
+//	                       Timestamp if outside time.Time's range
+//	date, datetime         time.Time (UTC)
+//	float32 vector         []float32
+//	float64 vector         VectorF64
+//	other extensions       Ext
+//
+// Decode is strict (SPEC §7): it rejects trailing bytes, invalid UTF-8,
+// duplicate keys and malformed extensions, and never allocates much more
+// than the input justifies. A signed document is rejected with
+// CodeAuthenticationFailed; use DecodeWithOptions with an HMACKey.
+func Decode(data []byte) (any, error) {
+	return DecodeWithOptions(data, DecodeOptions{})
 }
 
-func bytesToData(data []byte) unsafe.Pointer {
-	// Convert Go byte slice to C buffer
-	// This is a simplified placeholder
-	return nil
+// DecodeWithOptions is like Decode but applies o.
+func DecodeWithOptions(data []byte, o DecodeOptions) (any, error) {
+	cfg, err := o.config()
+	if err != nil {
+		return nil, err
+	}
+	doc, err := openDocument(data, &cfg)
+	if err != nil {
+		return nil, err
+	}
+	return cfg.decodeBare(doc, true)
 }
 
-func compressData(data unsafe.Pointer, algo CompressionAlgorithm, level int) unsafe.Pointer {
-	// Call C compression functions
-	return nil
+// Unmarshal decodes a BTOON document into the value pointed to by v, which
+// must be a non-nil pointer. It accepts the same documents as Decode.
+//
+// Unmarshal follows the conventions of encoding/json: it allocates pointers
+// and maps as needed, matches map keys to struct fields by their BTOON name
+// (exactly; matching is case-sensitive), ignores unknown keys (see
+// DecodeOptions.DisallowUnknownFields), leaves values unchanged for a BTOON
+// nil unless they are pointers, interfaces, maps or slices, and stores the
+// dynamic values of Decode in interface values.
+//
+// Integers are stored in integer fields of any size, failing with
+// CodeTypeMismatch on overflow; integers and floats are stored in float
+// fields; binary is stored in []byte, [N]byte (of equal length) and string;
+// strings in string and []byte; timestamps, dates and datetimes in
+// time.Time, Timestamp, Date and DateTime when the conversion is exact.
+// Types implementing encoding.BinaryUnmarshaler receive binary values.
+func Unmarshal(data []byte, v any) error {
+	return UnmarshalWithOptions(data, v, DecodeOptions{})
 }
 
-func decompressData(data unsafe.Pointer) unsafe.Pointer {
-	// Call C decompression functions
-	return nil
+// UnmarshalWithOptions is like Unmarshal but applies o.
+func UnmarshalWithOptions(data []byte, v any, o DecodeOptions) error {
+	rv := reflect.ValueOf(v)
+	if rv.Kind() != reflect.Pointer || rv.IsNil() {
+		return newError(CodeInvalidArgument, "Unmarshal needs a non-nil pointer, not "+describeTarget(v))
+	}
+	src, err := DecodeWithOptions(data, o)
+	if err != nil {
+		return err
+	}
+	a := assigner{disallowUnknown: o.DisallowUnknownFields}
+	return a.assign(rv.Elem(), src)
 }
 
-// Stream encoder for processing large datasets
-type StreamEncoder struct {
-	encoder unsafe.Pointer
+func describeTarget(v any) string {
+	if v == nil {
+		return "nil"
+	}
+	return reflect.TypeOf(v).String()
 }
 
-// NewStreamEncoder creates a new streaming encoder
-func NewStreamEncoder() *StreamEncoder {
-	return &StreamEncoder{}
+// decodeConfig is DecodeOptions with defaults applied.
+type decodeConfig struct {
+	strict          bool
+	maxDepth        int
+	maxDecompressed int
+	noDecompress    bool
+	hmacKey         []byte
+	timeTypes       bool
 }
 
-// Encode adds an object to the stream
-func (s *StreamEncoder) Encode(v interface{}) error {
-	// Implementation
-	return nil
+func (o *DecodeOptions) config() (decodeConfig, error) {
+	maxDepth, err := resolveMaxDepth(o.MaxDepth)
+	if err != nil {
+		return decodeConfig{}, err
+	}
+	maxSize := o.MaxDecompressedSize
+	switch {
+	case maxSize < 0:
+		return decodeConfig{}, newError(CodeInvalidArgument, "MaxDecompressedSize is negative")
+	case maxSize == 0:
+		maxSize = DefaultMaxDecompressedSize
+	}
+	if o.HMACKey != nil && len(o.HMACKey) == 0 {
+		return decodeConfig{}, newError(CodeInvalidArgument, "HMACKey is empty")
+	}
+	return decodeConfig{
+		strict:          !o.NonStrict,
+		maxDepth:        maxDepth,
+		maxDecompressed: maxSize,
+		noDecompress:    o.DisableDecompression,
+		hmacKey:         o.HMACKey,
+		timeTypes:       o.PreserveTimeTypes,
+	}, nil
 }
 
-// Flush finalizes the stream
-func (s *StreamEncoder) Flush() ([]byte, error) {
-	// Implementation
-	return nil, nil
+// decodeBare decodes a bare document. If whole is false, trailing bytes are
+// never an error.
+func (c *decodeConfig) decodeBare(doc []byte, whole bool) (any, error) {
+	d := decoder{data: doc, strict: c.strict, maxDepth: c.maxDepth, timeTypes: c.timeTypes}
+	if whole {
+		return d.document()
+	}
+	return d.value(0)
 }
 
-// Close releases resources
-func (s *StreamEncoder) Close() error {
-	// Implementation
-	return nil
-}
-
-// Stream decoder for processing large datasets
-type StreamDecoder struct {
-	decoder unsafe.Pointer
-}
-
-// NewStreamDecoder creates a new streaming decoder
-func NewStreamDecoder(data []byte) *StreamDecoder {
-	return &StreamDecoder{}
-}
-
-// Decode reads the next object from the stream
-func (s *StreamDecoder) Decode() (interface{}, error) {
-	// Implementation
-	return nil, nil
-}
-
-// Close releases resources
-func (s *StreamDecoder) Close() error {
-	// Implementation
-	return nil
+func resolveMaxDepth(n int) (int, error) {
+	switch {
+	case n == 0:
+		return DefaultMaxDepth, nil
+	case n < 0:
+		return 0, newError(CodeInvalidArgument, "MaxDepth is negative")
+	case n > maxMaxDepth:
+		return 0, newError(CodeInvalidArgument, "MaxDepth above "+strconv.Itoa(maxMaxDepth))
+	}
+	return n, nil
 }

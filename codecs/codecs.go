@@ -1,0 +1,201 @@
+// Package codecs registers the optional compression algorithms of the BTOON
+// compression envelope (SPEC §6) with package btoon: LZ4 (block format),
+// Zstandard, Brotli and Snappy (raw block format). zlib is always built in.
+//
+// Import the package for its side effect:
+//
+//	import _ "github.com/BTOON-project/btoon-go/codecs"
+//
+// The codecs use github.com/pierrec/lz4/v4, github.com/klauspost/compress
+// (zstd), github.com/andybalholm/brotli and github.com/golang/snappy, all
+// without cgo. Package btoon itself has no third-party dependencies.
+//
+// Every decompressor stops at the size declared by the envelope (which
+// btoon has already checked against DecodeOptions.MaxDecompressedSize) and
+// fails unless the payload expands to exactly that size.
+package codecs
+
+import (
+	"bytes"
+	"errors"
+	"fmt"
+	"sync"
+
+	"github.com/andybalholm/brotli"
+	"github.com/golang/snappy"
+	"github.com/klauspost/compress/zstd"
+	"github.com/pierrec/lz4/v4"
+
+	btoon "github.com/BTOON-project/btoon-go"
+)
+
+func init() {
+	btoon.RegisterCodec(btoon.LZ4, LZ4)
+	btoon.RegisterCodec(btoon.Zstd, Zstd)
+	btoon.RegisterCodec(btoon.Brotli, Brotli)
+	btoon.RegisterCodec(btoon.Snappy, Snappy)
+}
+
+// The codecs registered by this package.
+var (
+	LZ4    btoon.Codec = lz4Codec{}
+	Zstd   btoon.Codec = &zstdCodec{}
+	Brotli btoon.Codec = brotliCodec{}
+	Snappy btoon.Codec = snappyCodec{}
+)
+
+var errSize = errors.New("payload does not decompress to the declared size")
+
+// --- LZ4 (block format, no frame) ----------------------------------------------------
+
+type lz4Codec struct{}
+
+var lz4Levels = [...]lz4.CompressionLevel{lz4.Level1, lz4.Level2, lz4.Level3, lz4.Level4, lz4.Level5, lz4.Level6, lz4.Level7, lz4.Level8, lz4.Level9}
+
+var lz4Fast = sync.Pool{New: func() any { return new(lz4.Compressor) }}
+
+// Compress uses the fast LZ4 compressor for level 0 (and below) and the
+// high-compression compressor for levels 1 to 9.
+func (lz4Codec) Compress(src []byte, level int) ([]byte, error) {
+	dst := make([]byte, lz4.CompressBlockBound(len(src)))
+	var n int
+	var err error
+	if level <= 0 {
+		c := lz4Fast.Get().(*lz4.Compressor)
+		n, err = c.CompressBlock(src, dst)
+		lz4Fast.Put(c)
+	} else {
+		c := lz4.CompressorHC{Level: lz4Levels[min(level, len(lz4Levels))-1]}
+		n, err = c.CompressBlock(src, dst)
+	}
+	if err != nil {
+		return nil, err
+	}
+	return dst[:n], nil
+}
+
+func (lz4Codec) Decompress(src []byte, size int) ([]byte, error) {
+	// An LZ4 block expands at most about 255x, so larger claims are
+	// impossible; rejecting them avoids allocating for a lying header.
+	if uint64(size) > uint64(len(src))*255+16 {
+		return nil, fmt.Errorf("lz4: %d bytes cannot expand to %d", len(src), size)
+	}
+	dst := make([]byte, size)
+	n, err := lz4.UncompressBlock(src, dst)
+	if err != nil {
+		return nil, err
+	}
+	if n != size {
+		return nil, errSize
+	}
+	return dst, nil
+}
+
+// --- Zstandard (RFC 8878 frame) --------------------------------------------------------
+
+type zstdCodec struct {
+	encoders sync.Map // level -> *zstd.Encoder (EncodeAll is safe for concurrent use)
+}
+
+func (c *zstdCodec) Compress(src []byte, level int) ([]byte, error) {
+	if e, ok := c.encoders.Load(level); ok {
+		return e.(*zstd.Encoder).EncodeAll(src, nil), nil
+	}
+	opts := []zstd.EOption{zstd.WithEncoderConcurrency(1)}
+	if level != 0 {
+		opts = append(opts, zstd.WithEncoderLevel(zstd.EncoderLevelFromZstd(level)))
+	}
+	enc, err := zstd.NewWriter(nil, opts...)
+	if err != nil {
+		return nil, err
+	}
+	e, _ := c.encoders.LoadOrStore(level, enc)
+	return e.(*zstd.Encoder).EncodeAll(src, nil), nil
+}
+
+// Zstandard frames may declare a window larger than their content (for
+// example when written by a streaming compressor). Windows up to 8 MiB,
+// enough for every non-"ultra" level, are always accepted; larger windows
+// only when the declared size needs them, and never above 128 MiB (the
+// default limit of the reference zstd library).
+const (
+	zstdMinWindowLimit = 8 << 20
+	zstdMaxWindowLimit = 128 << 20
+)
+
+func (*zstdCodec) Decompress(src []byte, size int) ([]byte, error) {
+	window := uint64(min(max(size, zstdMinWindowLimit), zstdMaxWindowLimit))
+	d, err := zstd.NewReader(bytes.NewReader(src),
+		zstd.WithDecoderConcurrency(1),
+		zstd.WithDecoderLowmem(true),
+		zstd.WithDecoderMaxMemory(window),
+		zstd.WithDecoderMaxWindow(window))
+	if err != nil {
+		return nil, err
+	}
+	defer d.Close()
+	return btoon.ReadDecompressed(d, size)
+}
+
+// --- Brotli (RFC 7932 stream) ------------------------------------------------------------
+
+type brotliCodec struct{}
+
+func (brotliCodec) Compress(src []byte, level int) ([]byte, error) {
+	if level == 0 {
+		level = brotli.DefaultCompression
+	}
+	var buf bytes.Buffer
+	w := brotli.NewWriterLevel(&buf, level)
+	if _, err := w.Write(src); err != nil {
+		return nil, err
+	}
+	if err := w.Close(); err != nil {
+		return nil, err
+	}
+	return buf.Bytes(), nil
+}
+
+// Decompress fails on trailing bytes after the stream: the brotli reader
+// reports them as "excessive input".
+func (brotliCodec) Decompress(src []byte, size int) ([]byte, error) {
+	return btoon.ReadDecompressed(brotli.NewReader(bytes.NewReader(src)), size)
+}
+
+// --- Snappy (raw block format) ---------------------------------------------------------
+
+// snappyCodec uses github.com/golang/snappy, which accepts exactly the
+// Snappy format. (The S2-based decoder of klauspost/compress/snappy also
+// accepts S2 extensions such as repeat offsets, which the reference Snappy
+// library rejects; that would be a parser differential.)
+type snappyCodec struct{}
+
+func (snappyCodec) Compress(src []byte, _ int) ([]byte, error) {
+	if snappy.MaxEncodedLen(len(src)) < 0 {
+		return nil, snappy.ErrTooLarge
+	}
+	return snappy.Encode(nil, src), nil
+}
+
+func (snappyCodec) Decompress(src []byte, size int) ([]byte, error) {
+	n, err := snappy.DecodedLen(src)
+	if err != nil {
+		return nil, err
+	}
+	if n != size {
+		return nil, errSize
+	}
+	// A snappy block expands at most about 21x (a 3-byte copy of 64
+	// bytes); reject impossible claims before allocating.
+	if uint64(n) > uint64(len(src))*32+64 {
+		return nil, fmt.Errorf("snappy: %d bytes cannot expand to %d", len(src), n)
+	}
+	out, err := snappy.Decode(make([]byte, n), src)
+	if err != nil {
+		return nil, err
+	}
+	if len(out) != size {
+		return nil, errSize
+	}
+	return out, nil
+}

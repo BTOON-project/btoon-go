@@ -14,8 +14,7 @@
 coverage.html
 coverage.txt
 
-# Go module cache
-/go.sum
+# Vendored dependencies
 /vendor/
 
 # Build directories
@@ -35,10 +34,6 @@ coverage.txt
 .DS_Store
 Thumbs.db
 desktop.ini
-
-# Core submodule build artifacts
-core/build/
-core/cmake-build-*/
 
 # Temporary files
 *.tmp

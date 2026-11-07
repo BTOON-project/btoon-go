@@ -1,0 +1,61 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: Go ${{ matrix.go }} on ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+        go: ["1.22", "stable"]
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-go@v7
+        with:
+          go-version: ${{ matrix.go }}
+
+      # Go 1.22's internal linker omits LC_UUID, which recent macOS versions
+      # require for some binaries; link those test binaries externally.
+      - name: Use the external linker (macOS, Go 1.22)
+        if: runner.os == 'macOS' && matrix.go == '1.22'
+        shell: bash
+        run: echo "GOFLAGS=-ldflags=-linkmode=external" >> "$GITHUB_ENV"
+
+      - name: go vet
+        run: go vet ./...
+
+      # Checked on Linux only: Windows checkouts may convert line endings.
+      - name: gofmt
+        if: runner.os == 'Linux'
+        run: |
+          unformatted="$(gofmt -l .)"
+          if [ -n "$unformatted" ]; then
+            echo "These files need gofmt:"
+            echo "$unformatted"
+            exit 1
+          fi
+
+      - name: Test (race detector, conformance vectors)
+        run: go test -race -count=1 ./...
+
+  fuzz:
+    name: Fuzz smoke test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version: stable
+      - name: Fuzz the decoder for 30s
+        run: go test -run='^$' -fuzz=FuzzDecode -fuzztime=30s .
