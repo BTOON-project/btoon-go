@@ -1,104 +1,88 @@
+// Command basic demonstrates the btoon package: struct encoding, dynamic
+// decoding, the tabular encoding, compression, signing and error codes.
 package main
 
 import (
+	"errors"
 	"fmt"
 	"log"
+	"sort"
+	"time"
 
 	btoon "github.com/BTOON-project/btoon-go"
 )
 
+type User struct {
+	ID      int       `btoon:"id"`
+	Name    string    `btoon:"name"`
+	Email   string    `btoon:"email,omitempty"`
+	Roles   []string  `btoon:"roles"`
+	Created time.Time `btoon:"created"`
+	Avatar  []byte    `btoon:"avatar,omitempty"`
+}
+
 func main() {
-	fmt.Println("BTOON Go Basic Example")
-	fmt.Println("======================")
+	fmt.Printf("btoon %s (spec %s)\n\n", btoon.Version, btoon.SpecVersion)
 
-	// Simple data types
-	simpleData := map[string]interface{}{
-		"message": "Hello, BTOON!",
-		"count":   42,
-		"pi":      3.14159,
-		"active":  true,
-		"empty":   nil,
-	}
-
-	fmt.Println("\n1. Simple data encoding:")
-	fmt.Printf("Original: %+v\n", simpleData)
-
-	encoded, err := btoon.Encode(simpleData)
+	// 1. Structs encode as maps with canonical (sorted) keys.
+	u := User{ID: 1, Name: "Ada", Roles: []string{"admin"}, Created: time.Date(2025, 1, 2, 3, 4, 5, 0, time.UTC)}
+	b, err := btoon.Marshal(u)
 	if err != nil {
 		log.Fatal(err)
 	}
-	fmt.Printf("Encoded size: %d bytes\n", len(encoded))
+	fmt.Printf("1. User as BTOON (%d bytes): %x\n", len(b), b)
 
-	decoded, err := btoon.Decode(encoded)
+	var back User
+	if err := btoon.Unmarshal(b, &back); err != nil {
+		log.Fatal(err)
+	}
+	fmt.Printf("   decoded into a struct: %+v\n", back)
+
+	// 2. Decode without a target type gives the dynamic representation.
+	v, err := btoon.Decode(b)
 	if err != nil {
 		log.Fatal(err)
 	}
-	fmt.Printf("Decoded: %+v\n", decoded)
-
-	// Nested structures
-	nestedData := map[string]interface{}{
-		"user": map[string]interface{}{
-			"id":    1001,
-			"name":  "Alice",
-			"email": "alice@example.com",
-			"roles": []string{"admin", "user"},
-			"settings": map[string]interface{}{
-				"theme":         "dark",
-				"notifications": true,
-				"language":      "en",
-			},
-		},
-		"metadata": map[string]interface{}{
-			"created": "2024-01-01T00:00:00Z",
-			"version": "0.0.1",
-		},
+	m := v.(map[string]any)
+	keys := make([]string, 0, len(m))
+	for k := range m {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	for _, k := range keys {
+		fmt.Printf("   %-8s %T\n", k, m[k])
 	}
 
-	fmt.Println("\n2. Nested structure encoding:")
-	nestedEncoded, err := btoon.Encode(nestedData)
+	// 3. Arrays of uniform records use the columnar encoding when smaller.
+	users := make([]User, 50)
+	for i := range users {
+		users[i] = User{ID: i, Name: fmt.Sprintf("user%d", i), Roles: []string{"reader"}, Created: u.Created}
+	}
+	tabular, _ := btoon.Marshal(users)
+	plain, _ := btoon.MarshalWithOptions(users, btoon.EncodeOptions{DisableTabular: true})
+	fmt.Printf("\n3. 50 users: %d bytes tabular, %d bytes as a plain array\n", len(tabular), len(plain))
+
+	// 4. Compression (zlib is built in) and an HMAC-SHA256 signature.
+	key := []byte("demo key, use 32+ random bytes!!")
+	sealed, err := btoon.MarshalWithOptions(users, btoon.EncodeOptions{Compress: true, HMACKey: key})
 	if err != nil {
 		log.Fatal(err)
 	}
-	fmt.Printf("BTOON size: %d bytes\n", len(nestedEncoded))
+	fmt.Printf("4. compressed and signed: %d bytes (%q envelope around %q)\n", len(sealed), sealed[:4], sealed[40:44])
 
-	// Arrays of different types
-	arrayData := map[string]interface{}{
-		"numbers": []int{1, 2, 3, 4, 5},
-		"strings": []string{"apple", "banana", "cherry"},
-		"mixed":   []interface{}{42, "hello", true, nil, map[string]string{"key": "value"}},
-		"matrix":  [][]int{{1, 2}, {3, 4}, {5, 6}},
-	}
-
-	fmt.Println("\n3. Array encoding:")
-	arrayEncoded, err := btoon.Encode(arrayData)
-	if err != nil {
+	var got []User
+	if err := btoon.UnmarshalWithOptions(sealed, &got, btoon.DecodeOptions{HMACKey: key}); err != nil {
 		log.Fatal(err)
 	}
+	fmt.Printf("   verified and decoded %d users\n", len(got))
 
-	arrayDecoded, err := btoon.Decode(arrayEncoded)
-	if err != nil {
-		log.Fatal(err)
+	// 5. Errors carry the machine-readable codes of SPEC §7.
+	sealed[len(sealed)-1] ^= 1
+	_, err = btoon.DecodeWithOptions(sealed, btoon.DecodeOptions{HMACKey: key})
+	var be *btoon.Error
+	if errors.As(err, &be) {
+		fmt.Printf("\n5. tampered input: code=%s (%v)\n", be.Code, err)
 	}
-	fmt.Printf("Arrays preserved correctly\n")
-
-	// Binary data
-	binaryData := map[string]interface{}{
-		"id":       "file-001",
-		"content":  []byte("Binary content here"),
-		"checksum": []byte{0xDE, 0xAD, 0xBE, 0xEF},
-	}
-
-	fmt.Println("\n4. Binary data encoding:")
-	binaryEncoded, err := btoon.Encode(binaryData)
-	if err != nil {
-		log.Fatal(err)
-	}
-
-	binaryDecoded, err := btoon.Decode(binaryEncoded)
-	if err != nil {
-		log.Fatal(err)
-	}
-	fmt.Println("Binary data preserved correctly")
-
-	fmt.Println("\n✅ All basic examples completed successfully!")
+	_, err = btoon.Decode([]byte{0x92, 0x01}) // an array of 2 with one element
+	fmt.Printf("   truncated input: errors.Is(err, btoon.ErrTruncated) = %v\n", errors.Is(err, btoon.ErrTruncated))
 }
