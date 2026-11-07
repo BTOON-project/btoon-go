@@ -23,7 +23,7 @@ implementation. Decoding is **hardened** against hostile input.
 | Specification       | BTOON **0.1** (`btoon.SpecVersion`), [SPEC.md](https://github.com/BTOON-project/btoon-core/blob/main/docs/SPEC.md) |
 | Go                  | 1.22 or later                                                             |
 | Dependencies        | none in package `btoon` (standard library only); see [Compression](#compression) for the optional `codecs` package |
-| Conformance         | all 204 vectors of btoon-core's `btoon-vectors.json` (vendored in `testdata/`) pass; the zstd, lz4 and brotli vectors need the `codecs` package |
+| Conformance         | all 260 vectors of btoon-core's `btoon-vectors.json` (vendored in `testdata/`) pass; the zstd, lz4 and brotli vectors need the `codecs` package |
 
 ## Install
 
