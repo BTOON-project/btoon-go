@@ -1,6 +1,6 @@
 // Package btoon implements BTOON ("Binary TOON"), a compact, canonical,
 // MessagePack-compatible binary serialization format, as specified by
-// BTOON spec 0.1 (https://github.com/BTOON-project/btoon-core, docs/SPEC.md).
+// BTOON spec 0.2 (https://github.com/BTOON-project/btoon-core, docs/SPEC.md).
 //
 // BTOON is MessagePack with string map keys, plus a columnar ("tabular")
 // encoding for arrays of uniform records, extension types for timestamps,
@@ -29,13 +29,20 @@
 // string, []byte, []any, map[string]any, time.Time, *big.Int, []float32,
 // VectorF64, Ext); Unmarshal stores the document in a typed Go value. Both
 // are hardened against hostile input as SPEC §7 requires: every read is
-// bounds-checked, nesting is limited (128 by default), nothing is allocated
-// before checking that the remaining input could hold it, all that
-// containers reserve before their elements arrive is bounded by the size of
-// the document, strings and keys must be valid UTF-8, duplicate keys are
-// rejected, and compression envelopes are checked against a size limit
-// (256 MiB by default) before and while decompressing. Signed envelopes are
-// verified, in constant time, before the payload is parsed.
+// bounds-checked, nesting is limited (128 by default, at most 1000), nothing
+// is allocated before checking that the remaining input could hold it, all
+// that containers reserve before their elements arrive is bounded by the
+// size of the document, strings and keys must be valid UTF-8, duplicate
+// keys are rejected, and compression envelopes are checked against a size
+// limit (64 MiB by default) before and while decompressing. Signed
+// envelopes are verified, in constant time, before the payload is parsed.
+//
+// The memory a decoded document takes is bounded as SPEC §7.1 requires: a
+// document decodes to at most DecodeOptions.MaxValues values (2^20 by
+// default, counting every array element, map value, extension, tabular row
+// and cell), and a tabular array's rows × column-name bytes can't exceed
+// DecodeOptions.MaxDecompressedSize. Exceeding either fails with
+// CodeSizeLimit. With the defaults, decoding takes at most about 210 MB.
 //
 // # Errors
 //

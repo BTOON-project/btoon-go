@@ -1,10 +1,12 @@
 package btoon_test
 
 import (
+	"bytes"
 	"encoding/hex"
 	"errors"
 	"math"
 	"math/big"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -205,9 +207,29 @@ func TestExt(t *testing.T) {
 	wantHex(t, btoon.Ext{Type: 5}, "c70005")
 	wantHex(t, btoon.Ext{Type: -7, Data: make([]byte, 16)}, "d8f9"+strings.Repeat("00", 16))
 	wantHex(t, &btoon.Ext{Type: 2, Data: make([]byte, 300)}, "c8012c02"+strings.Repeat("00", 300))
+	// The ids BTOON defines can't be written as raw extensions (SPEC §5.7);
+	// the typed values write them.
 	for _, id := range []int8{-1, -2, -3, -4, -5, -6, -10} {
 		_, err := btoon.Marshal(btoon.Ext{Type: id, Data: []byte{0}})
 		wantErrCode(t, err, btoon.CodeInvalidArgument)
+		_, err = btoon.Marshal([]any{btoon.Ext{Type: id}})
+		wantErrCode(t, err, btoon.CodeInvalidArgument)
+	}
+	// Every other id is written as given: those reserved for future versions
+	// (-9…-7 and -128…-11), so that documents using them round-trip, and the
+	// application ids 0…127.
+	for id := -128; id <= 127; id++ {
+		if (id >= -6 && id <= -1) || id == -10 {
+			continue
+		}
+		x := btoon.Ext{Type: int8(id), Data: []byte{7}}
+		out, err := btoon.Marshal(x)
+		if err != nil || !bytes.Equal(out, []byte{0xd4, byte(int8(id)), 7}) {
+			t.Fatalf("id %d: %x %v", id, out, err)
+		}
+		if v, err := btoon.Decode(out); err != nil || !reflect.DeepEqual(v, x) {
+			t.Fatalf("id %d: decoded %#v %v", id, v, err)
+		}
 	}
 }
 

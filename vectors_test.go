@@ -11,6 +11,7 @@ import (
 	"os"
 	"sort"
 	"strconv"
+	"strings"
 	"testing"
 	"time"
 
@@ -26,20 +27,29 @@ type vectorFile struct {
 	Defaults struct {
 		MaxDepth            int  `json:"max_depth"`
 		MaxDecompressedSize int  `json:"max_decompressed_size"`
+		MaxValues           int  `json:"max_values"`
 		Strict              bool `json:"strict"`
 	} `json:"defaults"`
 	Vectors []vector `json:"vectors"`
 }
 
 type vector struct {
-	ID        string          `json:"id"`
-	Hex       string          `json:"hex"`
-	Value     json.RawMessage `json:"value"`
-	Canonical bool            `json:"canonical"`
-	Error     string          `json:"error"`
-	Requires  string          `json:"requires"`
-	Options   struct {
-		HMACKey string `json:"hmac_key"`
+	ID          string          `json:"id"`
+	Hex         string          `json:"hex"`
+	Value       json.RawMessage `json:"value"`
+	Canonical   bool            `json:"canonical"`
+	Error       string          `json:"error"`
+	EncodeError string          `json:"encode_error"`
+	Requires    string          `json:"requires"`
+	// Options are the decoder options of SPEC §10. A missing option takes
+	// the file's default; an empty hmac_key is an empty key, which is an
+	// error, not "no key".
+	Options struct {
+		Strict              *bool   `json:"strict"`
+		MaxDepth            *int    `json:"max_depth"`
+		MaxDecompressedSize *int    `json:"max_decompressed_size"`
+		MaxValues           *int    `json:"max_values"`
+		HMACKey             *string `json:"hmac_key"`
 	} `json:"options"`
 }
 
@@ -64,15 +74,47 @@ func (v *vector) bytes(tb testing.TB) []byte {
 	return b
 }
 
+// hmacKey returns the vector's key: nil without one, and an empty, non-nil
+// slice for an empty key.
 func (v *vector) hmacKey(tb testing.TB) []byte {
-	if v.Options.HMACKey == "" {
+	if v.Options.HMACKey == nil {
 		return nil
 	}
-	k, err := hex.DecodeString(v.Options.HMACKey)
+	k, err := hex.DecodeString(*v.Options.HMACKey)
 	if err != nil {
 		tb.Fatalf("%s: bad hmac_key: %v", v.ID, err)
 	}
-	return k
+	return append([]byte{}, k...)
+}
+
+// decodeOptions maps the vector's options to DecodeOptions. Every option
+// is given explicitly (the defaults were checked against the file's), so a
+// vector's limits are exactly the ones the file states.
+func (v *vector) decodeOptions(tb testing.TB, f *vectorFile) btoon.DecodeOptions {
+	o := btoon.DecodeOptions{
+		NonStrict:           !f.Defaults.Strict,
+		MaxDepth:            f.Defaults.MaxDepth,
+		MaxDecompressedSize: f.Defaults.MaxDecompressedSize,
+		MaxValues:           f.Defaults.MaxValues,
+		HMACKey:             v.hmacKey(tb),
+	}
+	if v.Options.Strict != nil {
+		o.NonStrict = !*v.Options.Strict
+	}
+	if v.Options.MaxDepth != nil {
+		o.MaxDepth = *v.Options.MaxDepth
+	}
+	if v.Options.MaxDecompressedSize != nil {
+		o.MaxDecompressedSize = *v.Options.MaxDecompressedSize
+	}
+	if v.Options.MaxValues != nil {
+		o.MaxValues = *v.Options.MaxValues
+	}
+	// 0 means "the default" in Go, so a limit of 0 can't be expressed.
+	if o.MaxDepth == 0 || o.MaxDecompressedSize == 0 || o.MaxValues == 0 {
+		tb.Fatalf("%s: a limit of 0 can't be expressed in DecodeOptions", v.ID)
+	}
+	return o
 }
 
 // codecAvailable reports whether the codec named by a vector's "requires"
@@ -92,11 +134,12 @@ func TestConformanceVectors(t *testing.T) {
 	if f.Spec != btoon.SpecVersion {
 		t.Fatalf("vectors are for spec %q, library implements %q", f.Spec, btoon.SpecVersion)
 	}
-	if f.Defaults.MaxDepth != btoon.DefaultMaxDepth || f.Defaults.MaxDecompressedSize != btoon.DefaultMaxDecompressedSize || !f.Defaults.Strict {
+	if f.Defaults.MaxDepth != btoon.DefaultMaxDepth || f.Defaults.MaxDecompressedSize != btoon.DefaultMaxDecompressedSize ||
+		f.Defaults.MaxValues != btoon.DefaultMaxValues || !f.Defaults.Strict {
 		t.Fatalf("vector defaults %+v differ from the library defaults", f.Defaults)
 	}
 
-	var decoded, encoded, rejected, skipped int
+	var decoded, encoded, rejected, encodeRejected, skipped int
 	for i := range f.Vectors {
 		v := &f.Vectors[i]
 		t.Run(v.ID, func(t *testing.T) {
@@ -104,8 +147,23 @@ func TestConformanceVectors(t *testing.T) {
 				skipped++
 				t.Skipf("requires the %s codec", v.Requires)
 			}
+			if v.EncodeError != "" {
+				// (d) encode_error vectors give a value that encoders must
+				// refuse.
+				want, err := parseTyped(v.Value)
+				if err != nil {
+					t.Fatalf("bad typed value: %v", err)
+				}
+				out, err := btoon.Marshal(buildGo(want))
+				checkCode(t, err, v.EncodeError)
+				if err == nil {
+					t.Fatalf("encoded to %x", out)
+				}
+				encodeRejected++
+				return
+			}
 			data := v.bytes(t)
-			opts := btoon.DecodeOptions{HMACKey: v.hmacKey(t)}
+			opts := v.decodeOptions(t, f)
 
 			if v.Error != "" {
 				// (c) error vectors are rejected with the matching code, both
@@ -167,9 +225,9 @@ func TestConformanceVectors(t *testing.T) {
 			}
 		})
 	}
-	t.Logf("%d vectors: %d decoded, %d re-encoded canonically, %d rejected with the expected code, %d skipped (codec not registered)",
-		len(f.Vectors), decoded, encoded, rejected, skipped)
-	if decoded+rejected+skipped != len(f.Vectors) && !t.Failed() {
+	t.Logf("%d vectors: %d decoded, %d re-encoded canonically, %d rejected with the expected code, %d refused by the encoder, %d skipped (codec not registered)",
+		len(f.Vectors), decoded, encoded, rejected, encodeRejected, skipped)
+	if decoded+rejected+encodeRejected+skipped != len(f.Vectors) && !t.Failed() {
 		t.Fatalf("accounting error")
 	}
 }
@@ -238,14 +296,53 @@ func parseFloat(s string) float64 {
 	return f
 }
 
-func (tv typed) floats() []float64 {
+func (tv typed) strings() []string {
 	var ss []string
 	if err := json.Unmarshal(tv.raw, &ss); err != nil {
 		panic(err)
 	}
+	return ss
+}
+
+// float32s and float64s parse vector elements (SPEC §10): "NaN" is the
+// canonical quiet NaN of the width, "0x…" gives the exact bits (most
+// significant byte first), and anything else is a decimal or ±Infinity.
+func (tv typed) float32s() []float32 {
+	ss := tv.strings()
+	out := make([]float32, len(ss))
+	for i, s := range ss {
+		switch {
+		case s == "NaN":
+			out[i] = math.Float32frombits(0x7fc00000)
+		case strings.HasPrefix(s, "0x"):
+			bits, err := strconv.ParseUint(s[2:], 16, 32)
+			if err != nil || len(s) != 10 {
+				panic("bad float32 bits " + s)
+			}
+			out[i] = math.Float32frombits(uint32(bits))
+		default:
+			out[i] = float32(parseFloat(s))
+		}
+	}
+	return out
+}
+
+func (tv typed) float64s() []float64 {
+	ss := tv.strings()
 	out := make([]float64, len(ss))
 	for i, s := range ss {
-		out[i] = parseFloat(s)
+		switch {
+		case s == "NaN":
+			out[i] = math.Float64frombits(0x7ff8000000000000)
+		case strings.HasPrefix(s, "0x"):
+			bits, err := strconv.ParseUint(s[2:], 16, 64)
+			if err != nil || len(s) != 18 {
+				panic("bad float64 bits " + s)
+			}
+			out[i] = math.Float64frombits(bits)
+		default:
+			out[i] = parseFloat(s)
+		}
 	}
 	return out
 }
@@ -372,14 +469,9 @@ func buildGo(tv typed) any {
 	case "datetime":
 		return btoon.DateTime(tv.int64())
 	case "float32_vector":
-		fs := tv.floats()
-		out := make([]float32, len(fs))
-		for i, f := range fs {
-			out[i] = float32(f)
-		}
-		return out
+		return tv.float32s()
 	case "float64_vector":
-		return btoon.VectorF64(tv.floats())
+		return btoon.VectorF64(tv.float64s())
 	case "ext":
 		return tv.ext()
 	}
@@ -522,25 +614,26 @@ func matchTyped(got any, want typed, timeTypes bool) error {
 			return fmt.Errorf("want %v (UTC), got %#v", wt.UTC(), got)
 		}
 	case "float32_vector":
-		w := want.floats()
+		// Vectors are compared bit for bit, NaN payloads included.
+		w := want.float32s()
 		g, ok := got.([]float32)
 		if !ok || g == nil || len(g) != len(w) {
 			return fmt.Errorf("want []float32 of %d, got %#v", len(w), got)
 		}
 		for i := range w {
-			if math.Float32bits(g[i]) != math.Float32bits(float32(w[i])) {
-				return fmt.Errorf("[%d]: want %v, got %v", i, w[i], g[i])
+			if math.Float32bits(g[i]) != math.Float32bits(w[i]) {
+				return fmt.Errorf("[%d]: want %#08x, got %#08x", i, math.Float32bits(w[i]), math.Float32bits(g[i]))
 			}
 		}
 	case "float64_vector":
-		w := want.floats()
+		w := want.float64s()
 		g, ok := got.(btoon.VectorF64)
 		if !ok || g == nil || len(g) != len(w) {
 			return fmt.Errorf("want VectorF64 of %d, got %#v", len(w), got)
 		}
 		for i := range w {
 			if math.Float64bits(g[i]) != math.Float64bits(w[i]) {
-				return fmt.Errorf("[%d]: want %v, got %v", i, w[i], g[i])
+				return fmt.Errorf("[%d]: want %#016x, got %#016x", i, math.Float64bits(w[i]), math.Float64bits(g[i]))
 			}
 		}
 	case "ext":

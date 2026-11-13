@@ -4,6 +4,8 @@ import (
 	"bytes"
 	"encoding/binary"
 	"errors"
+	"io"
+	"math"
 	"runtime"
 	"strconv"
 	"strings"
@@ -23,15 +25,20 @@ func TestNonStrictMode(t *testing.T) {
 	if err != nil || v.(map[string]any)["a"] != int64(2) {
 		t.Fatalf("duplicate: %v %v", v, err)
 	}
-	// UTF-8 is not validated.
+	// String values are not checked for UTF-8.
 	if v, err := btoon.DecodeWithOptions(fromHex(t, "a1ff"), ns); err != nil || v != "\xff" {
 		t.Fatalf("utf8: %q %v", v, err)
 	}
-	if _, err := btoon.DecodeWithOptions(fromHex(t, "c718f600000001000000010000000200000001ff02000000020102"), ns); err != nil {
-		t.Fatalf("column name utf8: %v", err)
+	if v, err := btoon.DecodeWithOptions(fromHex(t, "81a161a1ff"), ns); err != nil || v.(map[string]any)["a"] != "\xff" {
+		t.Fatalf("utf8 map value: %q %v", v, err)
 	}
-	// Bounds, depth, extension and tabular checks are not relaxed.
+	// Bounds, depth, extension and tabular checks are not relaxed, and map
+	// keys and column names must be UTF-8: keys compare by their bytes, so
+	// replacing invalid sequences could merge two keys (SPEC §7).
 	for h, code := range map[string]string{
+		"81a1ff01":       btoon.CodeInvalidUTF8,
+		"82a1ff01a1fe02": btoon.CodeInvalidUTF8,
+		"c718f600000001000000010000000200000001ff02000000020102": btoon.CodeInvalidUTF8,
 		"dbffffffff61":                   btoon.CodeTruncated,
 		strings.Repeat("91", 129) + "c0": btoon.CodeMaxDepth,
 		"c703ff000000":                   btoon.CodeInvalidExtension,
@@ -55,6 +62,32 @@ func TestMaxDepthOption(t *testing.T) {
 	_, err = btoon.DecodeWithOptions(deep, btoon.DecodeOptions{MaxDepth: 1 << 20})
 	wantErrCode(t, err, btoon.CodeInvalidArgument)
 
+	// MaxDepth is at most MaxDepthLimit (1000) when encoding and decoding
+	// (SPEC §7): deeper limits could exhaust the stack.
+	limit := fromHex(t, strings.Repeat("91", btoon.MaxDepthLimit)+"c0")
+	v, err := btoon.DecodeWithOptions(limit, btoon.DecodeOptions{MaxDepth: btoon.MaxDepthLimit})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = btoon.DecodeWithOptions(limit, btoon.DecodeOptions{MaxDepth: btoon.MaxDepthLimit - 1})
+	wantErrCode(t, err, btoon.CodeMaxDepth)
+	_, err = btoon.DecodeWithOptions(fromHex(t, "c0"), btoon.DecodeOptions{MaxDepth: btoon.MaxDepthLimit + 1})
+	wantErrCode(t, err, btoon.CodeInvalidArgument)
+	if out, err := btoon.MarshalWithOptions(v, btoon.EncodeOptions{MaxDepth: btoon.MaxDepthLimit}); err != nil || !bytes.Equal(out, limit) {
+		t.Fatalf("encode at MaxDepthLimit: %v", err)
+	}
+	_, err = btoon.MarshalWithOptions(nil, btoon.EncodeOptions{MaxDepth: btoon.MaxDepthLimit + 1})
+	wantErrCode(t, err, btoon.CodeInvalidArgument)
+	var x any
+	err = btoon.UnmarshalWithOptions(fromHex(t, "c0"), &x, btoon.DecodeOptions{MaxDepth: btoon.MaxDepthLimit + 1})
+	wantErrCode(t, err, btoon.CodeInvalidArgument)
+	dec := btoon.NewDecoder(bytes.NewReader(fromHex(t, "c0")))
+	dec.SetOptions(btoon.DecodeOptions{MaxDepth: btoon.MaxDepthLimit + 1})
+	wantErrCode(t, dec.Decode(&x), btoon.CodeInvalidArgument)
+	enc := btoon.NewEncoder(io.Discard)
+	enc.SetOptions(btoon.EncodeOptions{MaxDepth: btoon.MaxDepthLimit + 1})
+	wantErrCode(t, enc.Encode(nil), btoon.CodeInvalidArgument)
+
 	// A tabular array counts as two levels (SPEC §7): the array and its rows.
 	tab := fromHex(t, "c71ff600000001000000010000000800000002616202000000080101010101010101") // size-rule-8-tabular
 	if _, err := btoon.DecodeWithOptions(tab, btoon.DecodeOptions{MaxDepth: 2}); err != nil {
@@ -63,7 +96,7 @@ func TestMaxDepthOption(t *testing.T) {
 	_, err = btoon.DecodeWithOptions(tab, btoon.DecodeOptions{MaxDepth: 1})
 	wantErrCode(t, err, btoon.CodeMaxDepth)
 	// The encoder counts the same way.
-	v, _ := btoon.Decode(tab)
+	v, _ = btoon.Decode(tab)
 	if _, err := btoon.MarshalWithOptions(v, btoon.EncodeOptions{MaxDepth: 2}); err != nil {
 		t.Fatal(err)
 	}
@@ -219,21 +252,27 @@ func nestedTabulars(levels, payload int) []byte {
 // in 1 MiB reserved 2 GiB, 127 map32 headers 5 GiB, and 64 nested tabulars
 // built 3.5 GiB of rows before failing (review 2026-11-13, X1). Reservations
 // now come out of one budget per document, the size of the document.
+//
+// The outer tabulars announce 65,573 to 67,309 rows each, which max_values
+// now stops at the 16th level (SPEC §7.1). With max_values out of the way, the
+// reservation budget still bounds what they allocate.
 func TestNestedContainersPreallocateBoundedMemory(t *testing.T) {
 	const payload = 64 << 10
 	for _, c := range []struct {
 		name string
 		doc  []byte
+		opts btoon.DecodeOptions
 		code string
 	}{
-		{"127 nested array32", nestedArrays(127, payload), btoon.CodeTruncated},
-		{"127 nested map32", nestedMaps(127, payload), btoon.CodeNonStringKey},
-		{"64 nested tabulars", nestedTabulars(64, payload), btoon.CodeInvalidTabular},
+		{"127 nested array32", nestedArrays(127, payload), btoon.DecodeOptions{}, btoon.CodeTruncated},
+		{"127 nested map32", nestedMaps(127, payload), btoon.DecodeOptions{}, btoon.CodeNonStringKey},
+		{"64 nested tabulars", nestedTabulars(64, payload), btoon.DecodeOptions{}, btoon.CodeSizeLimit},
+		{"64 nested tabulars, no max_values", nestedTabulars(64, payload), btoon.DecodeOptions{MaxValues: math.MaxInt}, btoon.CodeInvalidTabular},
 	} {
 		runtime.GC()
 		var before, after runtime.MemStats
 		runtime.ReadMemStats(&before)
-		_, err := btoon.Decode(c.doc)
+		_, err := btoon.DecodeWithOptions(c.doc, c.opts)
 		runtime.ReadMemStats(&after)
 		wantErrCode(t, err, c.code)
 		allocated := after.TotalAlloc - before.TotalAlloc
@@ -243,20 +282,18 @@ func TestNestedContainersPreallocateBoundedMemory(t *testing.T) {
 	}
 }
 
-// With MaxDepth raised to its limit, 65,535 nested array16 headers that each
-// announce 1,024 elements (198 KB) reserved 1.1 GiB. A fixed allowance per
-// container, as a fallback for when the budget runs out, would add up the
-// same way, so there is none: past the budget, containers start empty.
+// With MaxDepth raised to its limit, 999 nested array32 headers that each
+// announce every byte after them reserve 1.1 GiB per MiB of input without
+// the budget. A fixed allowance per container, as a fallback for when the
+// budget runs out, would add up the same way, so there is none: past the
+// budget, containers start empty. (Before MaxDepth was capped at 1,000,
+// 65,535 nested array16 headers reserved 1.1 GiB from 198 KB.)
 func TestDeepNestingReservesWithinTheDocumentSize(t *testing.T) {
-	const levels = 1<<16 - 1
-	doc := bytes.Repeat([]byte{0xc0}, levels*3+1024)
-	for i := 0; i < levels; i++ {
-		copy(doc[i*3:], []byte{0xdc, 0x04, 0x00})
-	}
+	doc := nestedArrays(btoon.MaxDepthLimit-1, 64<<10)
 	runtime.GC()
 	var before, after runtime.MemStats
 	runtime.ReadMemStats(&before)
-	_, err := btoon.DecodeWithOptions(doc, btoon.DecodeOptions{MaxDepth: 1 << 16})
+	_, err := btoon.DecodeWithOptions(doc, btoon.DecodeOptions{MaxDepth: btoon.MaxDepthLimit})
 	runtime.ReadMemStats(&after)
 	wantErrCode(t, err, btoon.CodeTruncated)
 	if allocated := after.TotalAlloc - before.TotalAlloc; allocated > 32<<20 {
@@ -271,7 +308,7 @@ func TestDeepNestingReservesWithinTheDocumentSize(t *testing.T) {
 func TestContainersDecodeTheSameWithoutABudget(t *testing.T) {
 	var docs [][]byte
 	for _, v := range loadVectors(t).Vectors {
-		if v.Options.HMACKey == "" && !strings.HasPrefix(v.Hex, "42544f4e") && !strings.HasPrefix(v.Hex, "42545347") {
+		if v.Options.HMACKey == nil && v.EncodeError == "" && !strings.HasPrefix(v.Hex, "42544f4e") && !strings.HasPrefix(v.Hex, "42545347") {
 			docs = append(docs, v.bytes(t))
 		}
 	}

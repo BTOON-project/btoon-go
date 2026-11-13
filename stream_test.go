@@ -81,6 +81,28 @@ func TestStreamTypedAndErrors(t *testing.T) {
 		t.Fatal(err)
 	}
 	wantErrCode(t, dec.Decode(&x), btoon.CodeTruncated)
+	// It reports what Decode reports for the same bytes, which can be an
+	// error before the end, or a value counted past MaxValues as the input
+	// ends (SPEC §7.1).
+	for _, c := range []struct {
+		hex  string
+		opts btoon.DecodeOptions
+		code string
+	}{
+		{"92a1ff", btoon.DecodeOptions{}, btoon.CodeInvalidUTF8},
+		{"81a161", btoon.DecodeOptions{MaxValues: 1}, btoon.CodeSizeLimit},
+		{"81a161", btoon.DecodeOptions{}, btoon.CodeTruncated},
+		{"a568656c", btoon.DecodeOptions{}, btoon.CodeTruncated},
+		{"dc00", btoon.DecodeOptions{}, btoon.CodeTruncated},
+	} {
+		_, want := btoon.DecodeWithOptions(fromHex(t, c.hex), c.opts)
+		wantErrCode(t, want, c.code)
+		for _, r := range []io.Reader{bytes.NewReader(fromHex(t, c.hex)), iotest.OneByteReader(bytes.NewReader(fromHex(t, c.hex)))} {
+			dec = btoon.NewDecoder(r)
+			dec.SetOptions(c.opts)
+			wantErrCode(t, dec.Decode(&x), c.code)
+		}
+	}
 
 	enc.SetOptions(btoon.EncodeOptions{Compress: true})
 	wantErrCode(t, enc.Encode(1), btoon.CodeInvalidArgument)
@@ -103,18 +125,20 @@ func TestStreamTypedAndErrors(t *testing.T) {
 }
 
 // A stream reports the same result as Decode for every bare conformance
-// vector.
+// vector, with the vector's options.
 func TestStreamMatchesDecode(t *testing.T) {
 	f := loadVectors(t)
 	for _, v := range f.Vectors {
 		data := v.bytes(t)
-		if len(data) == 0 || bytes.HasPrefix(data, []byte("BTON")) || bytes.HasPrefix(data, []byte("BTSG")) || v.Error == btoon.CodeTrailingData || v.Options.HMACKey != "" {
+		if len(data) == 0 || bytes.HasPrefix(data, []byte("BTON")) || bytes.HasPrefix(data, []byte("BTSG")) || v.Error == btoon.CodeTrailingData || v.Options.HMACKey != nil {
 			continue
 		}
+		opts := v.decodeOptions(t, f)
 		dec := btoon.NewDecoder(bytes.NewReader(data))
+		dec.SetOptions(opts)
 		var got any
 		err := dec.Decode(&got)
-		want, wantErr := btoon.Decode(data)
+		want, wantErr := btoon.DecodeWithOptions(data, opts)
 		if (err == nil) != (wantErr == nil) {
 			t.Fatalf("%s: stream %v, Decode %v", v.ID, err, wantErr)
 		}

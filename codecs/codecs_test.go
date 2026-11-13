@@ -169,7 +169,7 @@ func TestDecompressExactSize(t *testing.T) {
 				"declared-too-large": envelope(c.algo, payload, len(raw)+1),
 				"truncated":          envelope(c.algo, payload[:len(payload)-3], len(raw)),
 				"trailing-garbage":   envelope(c.algo, append(append([]byte{}, payload...), 0xde, 0xad, 0xbe, 0xef), len(raw)),
-				"lying-header":       envelope(c.algo, payload[:8], 200<<20),
+				"lying-header":       envelope(c.algo, payload[:8], btoon.DefaultMaxDecompressedSize),
 				"empty-payload":      envelope(c.algo, nil, len(raw)),
 			}
 			for name, env := range cases {
