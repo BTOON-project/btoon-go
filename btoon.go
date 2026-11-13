@@ -7,7 +7,7 @@ import (
 
 const (
 	// Version is the version of this library.
-	Version = "0.1.0"
+	Version = "0.1.1"
 	// SpecVersion is the version of the BTOON specification it implements.
 	SpecVersion = "0.1"
 )
