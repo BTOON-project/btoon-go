@@ -21,7 +21,7 @@ implementation. Decoding is **hardened** against hostile input.
 |---------------------|---------------------------------------------------------------------------|
 | Library version     | `0.1.0` (`btoon.Version`)                                                 |
 | Specification       | BTOON **0.1** (`btoon.SpecVersion`), [SPEC.md](https://github.com/BTOON-project/btoon-core/blob/main/docs/SPEC.md) |
-| Go                  | 1.22 or later                                                             |
+| Go                  | 1.25 or later                                                             |
 | Dependencies        | none in package `btoon` (standard library only); see [Compression](#compression) for the optional `codecs` package |
 | Conformance         | all 260 vectors of btoon-core's `btoon-vectors.json` (vendored in `testdata/`) pass; the zstd, lz4 and brotli vectors need the `codecs` package |
 
@@ -230,7 +230,10 @@ itself imports nothing outside the standard library. You can also implement the
 
 Decoders check the envelope header and the size limit before decompressing, stop at
 the declared size while decompressing, and reject payloads that are corrupt, have
-trailing bytes, or expand to more or fewer bytes than declared (`invalid_envelope`).
+trailing bytes, or expand to more or fewer bytes than declared (`invalid_envelope`). A
+Zstandard payload must be one frame: further frames and skippable frames are rejected,
+as in btoon-core. If a codec panics, which is a bug in that codec, `Marshal` and
+`Decode` recover and return an error instead of crashing the program.
 
 ## Errors
 
@@ -284,6 +287,9 @@ make bench        # benchmarks
 make example      # go run ./examples/basic
 make sync-vectors # copy ../btoon-core/tests/vectors/btoon-vectors.json
 ```
+
+CI also runs [govulncheck](https://go.dev/doc/security/vuln/) on every push and weekly,
+so a new advisory for a codec dependency fails the build.
 
 `FuzzDecode` checks that decoding never panics, that all failures carry a SPEC §7 code,
 and that decode → encode → decode returns an equal value whose encoding is stable.
