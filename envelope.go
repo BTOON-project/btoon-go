@@ -41,7 +41,7 @@ func compressDocument(raw []byte, algo Compression, level int) ([]byte, error) {
 	if uint64(len(raw)) > math.MaxUint32 {
 		return nil, newError(CodeSizeLimit, "document too large for a compression envelope")
 	}
-	payload, err := codec.Compress(raw, level)
+	payload, err := callCompress(codec, raw, level)
 	if err != nil {
 		return nil, wrapError(CodeInvalidArgument, algo.String()+" compression failed", err)
 	}
@@ -119,7 +119,7 @@ func openDocument(data []byte, o *decodeConfig) ([]byte, error) {
 	if codec == nil {
 		return nil, newError(CodeUnsupportedCompression, "no codec registered for "+algo.String())
 	}
-	out, err := codec.Decompress(data[compressionHeader:], int(usize))
+	out, err := callDecompress(codec, data[compressionHeader:], int(usize))
 	if err != nil {
 		var be *Error
 		if errors.As(err, &be) && be.Code != CodeInvalidArgument {
@@ -131,4 +131,37 @@ func openDocument(data []byte, o *decodeConfig) ([]byte, error) {
 		return nil, newError(CodeInvalidEnvelope, algo.String()+" payload does not decompress to uncompressed_size")
 	}
 	return out, nil
+}
+
+// callCompress and callDecompress run a codec, turning a panic into an
+// error. Codecs are third-party code that reads untrusted input, and a bug
+// in one (such as GO-2026-6865 in klauspost/compress) must not crash the
+// program.
+func callCompress(c Codec, src []byte, level int) (out []byte, err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			out, err = nil, codecPanic(r)
+		}
+	}()
+	return c.Compress(src, level)
+}
+
+func callDecompress(c Codec, src []byte, size int) (out []byte, err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			out, err = nil, codecPanic(r)
+		}
+	}()
+	return c.Decompress(src, size)
+}
+
+func codecPanic(r any) error {
+	msg := "unknown panic value"
+	switch v := r.(type) {
+	case error:
+		msg = v.Error()
+	case string:
+		msg = v
+	}
+	return errors.New("codec panicked: " + msg)
 }

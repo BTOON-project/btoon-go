@@ -12,11 +12,13 @@
 //
 // Every decompressor stops at the size declared by the envelope (which
 // btoon has already checked against DecodeOptions.MaxDecompressedSize) and
-// fails unless the payload expands to exactly that size.
+// fails unless the payload expands to exactly that size. A Zstandard
+// payload must be a single frame, with no skippable frames.
 package codecs
 
 import (
 	"bytes"
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"sync"
@@ -124,6 +126,16 @@ const (
 )
 
 func (*zstdCodec) Decompress(src []byte, size int) ([]byte, error) {
+	// The payload is exactly one Zstandard frame (SPEC §6). The decoder
+	// would go on to read further frames, skipping skippable ones, so find
+	// where the first frame ends before decoding.
+	n, err := zstdFrameSize(src)
+	if err != nil {
+		return nil, err
+	}
+	if n != len(src) {
+		return nil, errors.New("zstd: trailing bytes after the frame")
+	}
 	window := uint64(min(max(size, zstdMinWindowLimit), zstdMaxWindowLimit))
 	d, err := zstd.NewReader(bytes.NewReader(src),
 		zstd.WithDecoderConcurrency(1),
@@ -135,6 +147,63 @@ func (*zstdCodec) Decompress(src []byte, size int) ([]byte, error) {
 	}
 	defer d.Close()
 	return btoon.ReadDecompressed(d, size)
+}
+
+var errZstdTruncated = errors.New("zstd: frame is truncated")
+
+// zstdFrameSize returns the size of the Zstandard frame at the start of src
+// (RFC 8878 §3.1.1) by walking its block headers; the decoder checks the
+// blocks themselves. Skippable frames are not accepted.
+func zstdFrameSize(src []byte) (int, error) {
+	const magic = 0xFD2FB528
+	if len(src) < 5 || binary.LittleEndian.Uint32(src) != magic {
+		return 0, errors.New("zstd: payload does not start with a zstd frame")
+	}
+	fhd := src[4] // Frame_Header_Descriptor
+	singleSegment := fhd&0x20 != 0
+	n := 5
+	if !singleSegment {
+		n++ // Window_Descriptor
+	}
+	n += [4]int{0, 1, 2, 4}[fhd&3] // Dictionary_ID
+	switch fhd >> 6 {              // Frame_Content_Size
+	case 0:
+		if singleSegment {
+			n++
+		}
+	case 1:
+		n += 2
+	case 2:
+		n += 4
+	case 3:
+		n += 8
+	}
+	for last := false; !last; {
+		if len(src)-n < 3 {
+			return 0, errZstdTruncated
+		}
+		h := int(src[n]) | int(src[n+1])<<8 | int(src[n+2])<<16
+		n += 3
+		last = h&1 != 0
+		size := h >> 3 // Block_Size
+		switch h >> 1 & 3 {
+		case 1: // RLE_Block: a single byte, repeated Block_Size times
+			size = 1
+		case 3:
+			return 0, errors.New("zstd: reserved block type")
+		}
+		if len(src)-n < size {
+			return 0, errZstdTruncated
+		}
+		n += size
+	}
+	if fhd&0x04 != 0 { // Content_Checksum
+		n += 4
+	}
+	if n > len(src) {
+		return 0, errZstdTruncated
+	}
+	return n, nil
 }
 
 // --- Brotli (RFC 7932 stream) ------------------------------------------------------------

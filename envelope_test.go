@@ -149,6 +149,43 @@ func TestRegisteredCodec(t *testing.T) {
 	wantErrCode(t, err, btoon.CodeInvalidEnvelope)
 }
 
+// panicker and indexer are test codecs with the bug class of GO-2026-6865:
+// they panic, with a value or with a runtime error.
+type panicker struct{ value any }
+
+func (p panicker) Compress([]byte, int) ([]byte, error)   { panic(p.value) }
+func (p panicker) Decompress([]byte, int) ([]byte, error) { panic(p.value) }
+
+type indexer struct{}
+
+func (indexer) Compress(src []byte, _ int) ([]byte, error)   { return []byte{src[len(src)]}, nil }
+func (indexer) Decompress(src []byte, _ int) ([]byte, error) { return []byte{src[len(src)]}, nil }
+
+// TestCodecPanic checks that a panicking codec makes Marshal and Decode
+// fail instead of crashing the program.
+func TestCodecPanic(t *testing.T) {
+	doc := bigDoc()
+	restore := btoon.SwapCodecForTest(btoon.Snappy, zlibAsSnappy{})
+	defer restore()
+	env, err := btoon.MarshalWithOptions(doc, btoon.EncodeOptions{Compress: true, Compression: btoon.Snappy})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, c := range []btoon.Codec{panicker{"codec bug"}, panicker{errors.New("codec bug")}, panicker{42}, indexer{}} {
+		btoon.SwapCodecForTest(btoon.Snappy, c)
+		_, err := btoon.MarshalWithOptions(doc, btoon.EncodeOptions{Compress: true, Compression: btoon.Snappy})
+		wantErrCode(t, err, btoon.CodeInvalidArgument)
+		if !strings.Contains(err.Error(), "codec panicked") {
+			t.Errorf("Marshal error %q", err)
+		}
+		_, err = btoon.Decode(env)
+		wantErrCode(t, err, btoon.CodeInvalidEnvelope)
+		if !strings.Contains(err.Error(), "codec panicked") {
+			t.Errorf("Decode error %q", err)
+		}
+	}
+}
+
 func TestReadDecompressed(t *testing.T) {
 	data := bytes.Repeat([]byte("btoon"), 50000)
 	z := zlibBytes(t, data)

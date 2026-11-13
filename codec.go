@@ -36,7 +36,9 @@ func (c Compression) String() string {
 }
 
 // A Codec implements one compression algorithm for the compression
-// envelope. Implementations must be safe for concurrent use.
+// envelope. Implementations must be safe for concurrent use. A panic in
+// Compress or Decompress is recovered and reported as an error, with
+// CodeInvalidArgument from Compress and CodeInvalidEnvelope from Decompress.
 type Codec interface {
 	// Compress compresses src. level is EncodeOptions.CompressionLevel;
 	// 0 selects the codec's default.

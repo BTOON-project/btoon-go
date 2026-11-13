@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"os"
 	"reflect"
+	"slices"
 	"testing"
 
 	btoon "github.com/BTOON-project/btoon-go"
@@ -239,5 +240,96 @@ func TestConcurrentCodecs(t *testing.T) {
 		if err := <-done; err != nil {
 			t.Fatal(err)
 		}
+	}
+}
+
+// zstdPanicFrame is upstream's reproducer for GO-2026-6865
+// (klauspost/compress v1.20.2, zstd/decoder_test.go
+// TestDecoderHuffWeightsTableLog). Versions before v1.20.2 panic with an
+// index out of range while decoding it.
+func zstdPanicFrame() []byte {
+	return slices.Concat(
+		[]byte{0x28, 0xb5, 0x2f, 0xfd, 0x00, 0x38, 0x74, 0x06, 0x00, 0x42, 0xb8, 0x32, 0x0d, 0x1a, 0x00, 0x00, 0x00, 0x90, 0xaf, 0xfa, 0xff, 0x03, 0x00, 0x80, 0xff, 0x7f},
+		bytes.Repeat([]byte{0xa5, 0x94, 0x52, 0x4a, 0x29}, 37),
+		[]byte{0xa5, 0x94, 0x12, 0x00, 0xad, 0x56, 0x03, 0xee, 0xff, 0xdf, 0xb3, 0x1a, 0x1c, 0x1a, 0x00, 0xe0, 0xff, 0x1f, 0x0f, 0xb1, 0x9c, 0x5a, 0xcf, 0x4d, 0xe4, 0x1d, 0x7b, 0xab, 0x99, 0x5e, 0x01, 0x51, 0xa4, 0x73, 0xd8, 0xb1, 0xf3, 0x39, 0x4b, 0x67, 0xf6, 0xab, 0x1a, 0xab, 0x1a, 0xab, 0x1a},
+		bytes.Repeat([]byte{0x8c, 0x31, 0xc6, 0x18, 0x63}, 1365),
+		[]byte{0x8c, 0x31},
+		bytes.Repeat([]byte{0x63, 0x8c, 0x31, 0xc6, 0x18}, 1365),
+		[]byte{0x63, 0x2c},
+		bytes.Repeat([]byte{0x31, 0xc6, 0x18, 0x63, 0x8c}, 1365),
+		[]byte{0x31, 0x46},
+		bytes.Repeat([]byte{0x31, 0xc6, 0x18, 0x63, 0x8c}, 1365),
+		[]byte{0x31, 0x06, 0x00},
+	)
+}
+
+// TestZstdCraftedFrames checks that the frames behind GO-2026-6865 are
+// rejected without a panic, both by the codec and through Decode. The
+// second case splits the frame in two: before the fix, decoding the first
+// half left bad state in a pool and decoding the second half then panicked.
+func TestZstdCraftedFrames(t *testing.T) {
+	f := zstdPanicFrame()
+	two := slices.Concat(f[:6], []byte{0x75, 0x06, 0x00}, f[9:215], f[:6], f[215:])
+	for name, payloads := range map[string][][]byte{
+		"one-frame":    {f},
+		"primed-cache": {two[:215], two[215:]},
+	} {
+		t.Run(name, func(t *testing.T) {
+			for _, p := range payloads {
+				if _, err := codecs.Zstd.Decompress(p, 1<<20); err == nil {
+					t.Fatal("codec accepted a crafted frame")
+				}
+				_, err := btoon.Decode(envelope(btoon.Zstd, p, 1<<20))
+				wantCode(t, err, btoon.CodeInvalidEnvelope)
+			}
+		})
+	}
+}
+
+// TestZstdSingleFrame checks that the payload must be exactly one
+// Zstandard frame (SPEC §6): further frames, skippable frames and a payload
+// split over two frames are rejected, as they are by btoon-core.
+func TestZstdSingleFrame(t *testing.T) {
+	raw, err := btoon.Marshal(sampleDoc())
+	if err != nil {
+		t.Fatal(err)
+	}
+	frame, err := codecs.Zstd.Compress(raw, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	half, err := codecs.Zstd.Compress(raw[:len(raw)/2], 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rest, err := codecs.Zstd.Compress(raw[len(raw)/2:], 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// A frame with no content: single segment, content size 0, and one
+	// empty raw block that is the last.
+	empty := []byte{0x28, 0xb5, 0x2f, 0xfd, 0x20, 0x00, 0x01, 0x00, 0x00}
+	if out, err := codecs.Zstd.Decompress(empty, 0); err != nil || len(out) != 0 {
+		t.Fatalf("empty frame: %v", err)
+	}
+	skippable := []byte{0x50, 0x2a, 0x4d, 0x18, 0x04, 0x00, 0x00, 0x00, 0xde, 0xad, 0xbe, 0xef}
+	cases := map[string][]byte{
+		"empty-frame-after":     slices.Concat(frame, empty),
+		"empty-frame-before":    slices.Concat(empty, frame),
+		"skippable-frame-after": slices.Concat(frame, skippable),
+		"skippable-frame-first": slices.Concat(skippable, frame),
+		"two-halves":            slices.Concat(half, rest),
+		"frame-twice":           slices.Concat(frame, frame),
+		"truncated-checksum":    frame[:len(frame)-1],
+		"no-frame":              raw[:64],
+	}
+	for name, payload := range cases {
+		t.Run(name, func(t *testing.T) {
+			_, err := btoon.Decode(envelope(btoon.Zstd, payload, len(raw)))
+			wantCode(t, err, btoon.CodeInvalidEnvelope)
+		})
+	}
+	if _, err := btoon.Decode(envelope(btoon.Zstd, frame, len(raw))); err != nil {
+		t.Fatalf("valid frame: %v", err)
 	}
 }
