@@ -1,6 +1,8 @@
 package btoon_test
 
 import (
+	"bytes"
+	"encoding/binary"
 	"encoding/hex"
 	"errors"
 	"math"
@@ -8,6 +10,7 @@ import (
 	"reflect"
 	"strings"
 	"testing"
+	"time"
 
 	btoon "github.com/BTOON-project/btoon-go"
 )
@@ -274,5 +277,47 @@ func TestUnmarshalTabularIntoStructs(t *testing.T) {
 	}
 	if len(doc.Data) != 10 || doc.Data[9] != (row{9, -9}) {
 		t.Fatalf("got %+v", doc.Data)
+	}
+}
+
+// Error messages describe a large bigint by its size. Formatting it in
+// decimal took about 12 s for an 8 MiB bigint, which fits in an 8 KB
+// envelope (review 2026-11-13).
+func TestUnmarshalHugeBigIntError(t *testing.T) {
+	payload := append([]byte{0x7f}, bytes.Repeat([]byte{0xa5}, 8<<20-1)...)
+	doc := binary.BigEndian.AppendUint32([]byte{0x81, 0xa1, 'n', 0xc9}, uint32(len(payload)))
+	doc = append(append(doc, 0xfc), payload...)
+	env := compressionEnvelope(btoon.Zlib, zlibBytes(t, doc), len(doc))
+	if len(env) > 32<<10 {
+		t.Fatalf("envelope is %d bytes", len(env))
+	}
+	var into struct {
+		N int64 `btoon:"n"`
+	}
+	start := time.Now()
+	err := btoon.Unmarshal(env, &into)
+	elapsed := time.Since(start)
+	wantErrCode(t, err, btoon.CodeTypeMismatch)
+	if !strings.Contains(err.Error(), "cannot store integer of 67108863 bits in a Go value of type int64") {
+		t.Errorf("message: %.200s", err.Error())
+	}
+	if elapsed > 2*time.Second {
+		t.Errorf("Unmarshal took %v", elapsed)
+	}
+
+	// Values up to 128 bits are still shown in full.
+	for h, want := range map[string]string{
+		"c709fc010000000000000000":                 "integer 18446744073709551616",
+		"c711fc00ffffffffffffffffffffffffffffffff": "integer 340282366920938463463374607431768211455",
+		"c711fcff00000000000000000000000000000001": "integer -340282366920938463463374607431768211455",
+		"c711fc0100000000000000000000000000000000": "integer of 129 bits",
+		"c711fcff00000000000000000000000000000000": "negative integer of 129 bits",
+	} {
+		var i8 int8
+		err := btoon.Unmarshal(fromHex(t, h), &i8)
+		wantErrCode(t, err, btoon.CodeTypeMismatch)
+		if !strings.Contains(err.Error(), "cannot store "+want+" in") {
+			t.Errorf("%s: %v", h, err)
+		}
 	}
 }

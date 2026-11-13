@@ -4,6 +4,7 @@ import (
 	"encoding/binary"
 	"math"
 	"math/big"
+	"slices"
 	"unicode/utf8"
 )
 
@@ -11,13 +12,52 @@ import (
 //   - every read is bounds-checked, so hostile input cannot cause a panic;
 //   - containers are depth-limited, so recursion is bounded by maxDepth;
 //   - nothing is allocated for a container before checking that the
-//     remaining input could hold its elements.
+//     remaining input could hold its elements, and what all containers
+//     allocate before their elements are decoded is bounded by the size of
+//     the document (see reserve).
 type decoder struct {
 	data      []byte
 	pos       int
 	strict    bool
 	maxDepth  int
 	timeTypes bool // decode timestamps/dates/datetimes as Timestamp/Date/DateTime
+	budget    int  // slots containers may still reserve up front (see reserve)
+}
+
+// newDecoder returns a decoder for the bare document data.
+func newDecoder(data []byte, strict bool, maxDepth int, timeTypes bool) decoder {
+	return decoder{data: data, strict: strict, maxDepth: maxDepth, timeTypes: timeTypes, budget: len(data)}
+}
+
+// reserve returns how many slots a container that announces n elements may
+// allocate before decoding them: all n while the document's budget covers
+// them, otherwise none, and the container grows as its elements arrive.
+//
+// Checking n against the remaining input isn't enough on its own: nested
+// containers check against the same remaining bytes at every level, so 127
+// nested array32 headers in 1 MiB reserved 2 GiB (review 2026-11-13, X1).
+// The budget starts at the document's size in bytes and is never refunded.
+// Every element takes at least one byte of its own (an array element or
+// table cell its first byte, a map entry its key), so the elements of a
+// valid document never use more than the budget, and only containers that
+// announce more elements than they hold make others grow. Reservations
+// therefore stay proportional to the input at any nesting depth.
+func (d *decoder) reserve(n uint64) int {
+	if n > uint64(d.budget) {
+		return 0
+	}
+	d.budget -= int(n)
+	return int(n)
+}
+
+// grow returns s with room for one more of the n elements it will hold. A
+// full slice doubles (up to n), so its capacity stays within about twice
+// the elements decoded so far.
+func grow[T any](s []T, n uint64) []T {
+	if len(s) < cap(s) {
+		return s
+	}
+	return slices.Grow(s, int(min(uint64(max(len(s), 16)), n-uint64(len(s)))))
 }
 
 func (d *decoder) remaining() int { return len(d.data) - d.pos }
@@ -236,13 +276,24 @@ func (d *decoder) arrayValue(n uint64, depth, start int) (any, error) {
 	if n > uint64(d.remaining()) {
 		return nil, errorAt(CodeTruncated, "array length exceeds the remaining input", start)
 	}
-	a := make([]any, n)
-	for i := range a {
+	if uint64(d.reserve(n)) == n {
+		a := make([]any, n)
+		for i := range a {
+			v, err := d.value(depth + 1)
+			if err != nil {
+				return nil, err
+			}
+			a[i] = v
+		}
+		return a, nil
+	}
+	var a []any
+	for i := uint64(0); i < n; i++ {
 		v, err := d.value(depth + 1)
 		if err != nil {
 			return nil, err
 		}
-		a[i] = v
+		a = append(grow(a, n), v)
 	}
 	return a, nil
 }
@@ -255,7 +306,7 @@ func (d *decoder) mapValue(n uint64, depth, start int) (any, error) {
 	if n > uint64(d.remaining())/2 {
 		return nil, errorAt(CodeTruncated, "map length exceeds the remaining input", start)
 	}
-	m := make(map[string]any, n)
+	m := make(map[string]any, d.reserve(n))
 	for i := uint64(0); i < n; i++ {
 		keyPos := d.pos
 		k, err := d.key()
@@ -484,44 +535,97 @@ func (d *decoder) tabular(start, end, depth, extPos int) (any, error) {
 	pos += int(numCols) // type codes are informational (SPEC §5.6.1)
 
 	// Every cell is at least one byte, so N×C cells must fit in what is
-	// left. This bounds the allocation below.
-	if numRows*numCols > left() {
+	// left.
+	numCells := numRows * numCols
+	if numCells > left() {
 		return nil, bad("tabular row count exceeds the payload")
 	}
-	rows := make([]map[string]any, numRows)
-	for r := range rows {
-		rows[r] = make(map[string]any, numCols)
-	}
-
-	for _, name := range names {
+	// Each column is decoded by its own decoder, bounded by the column's
+	// length and sharing the document's budget.
+	openColumn := func() (col decoder, colEnd int, err error) {
 		colLen, ok := u32()
 		if !ok || colLen > left() {
-			return nil, bad("tabular column runs past the payload")
+			return decoder{}, 0, bad("tabular column runs past the payload")
 		}
-		colEnd := pos + int(colLen)
-		col := decoder{data: d.data[:colEnd], pos: pos, strict: d.strict, maxDepth: d.maxDepth, timeTypes: d.timeTypes}
-		for r := range rows {
-			v, err := col.value(depth + 2)
+		colEnd = pos + int(colLen)
+		col = decoder{data: d.data[:colEnd], pos: pos, strict: d.strict, maxDepth: d.maxDepth, timeTypes: d.timeTypes, budget: d.budget}
+		return col, colEnd, nil
+	}
+	closeColumn := func(col *decoder, colEnd int) error {
+		if col.pos != colEnd {
+			return errorAt(CodeInvalidTabular, "tabular column length does not match its values", col.pos)
+		}
+		d.budget = col.budget
+		pos = colEnd
+		return nil
+	}
+	cellError := func(err error) error {
+		if e, ok := err.(*Error); ok && e.Code == CodeTruncated {
+			return errorAt(CodeInvalidTabular, "tabular column holds fewer values than rows", e.Offset)
+		}
+		return err
+	}
+
+	var out []any
+	if uint64(d.reserve(numCells)) == numCells {
+		// The budget covers the cells: create the rows up front, sized for
+		// their columns, and store each cell in its row.
+		rows := make([]map[string]any, numRows)
+		for i := range rows {
+			rows[i] = make(map[string]any, numCols)
+		}
+		for _, name := range names {
+			col, colEnd, err := openColumn()
 			if err != nil {
-				if e, ok := err.(*Error); ok && e.Code == CodeTruncated {
-					return nil, errorAt(CodeInvalidTabular, "tabular column holds fewer values than rows", e.Offset)
-				}
 				return nil, err
 			}
-			rows[r][name] = v
+			for _, row := range rows {
+				v, err := col.value(depth + 2)
+				if err != nil {
+					return nil, cellError(err)
+				}
+				row[name] = v
+			}
+			if err := closeColumn(&col, colEnd); err != nil {
+				return nil, err
+			}
 		}
-		if col.pos != colEnd {
-			return nil, errorAt(CodeInvalidTabular, "tabular column length does not match its values", col.pos)
+		out = make([]any, numRows)
+		for i, row := range rows {
+			out[i] = row
 		}
-		pos = colEnd
+	} else {
+		// The header announces more cells than the budget allows, which a
+		// valid document never does: collect the cells as they are decoded,
+		// and build the rows once all of them are in.
+		var cells []any
+		for range names {
+			col, colEnd, err := openColumn()
+			if err != nil {
+				return nil, err
+			}
+			for i := uint64(0); i < numRows; i++ {
+				v, err := col.value(depth + 2)
+				if err != nil {
+					return nil, cellError(err)
+				}
+				cells = append(grow(cells, numCells), v)
+			}
+			if err := closeColumn(&col, colEnd); err != nil {
+				return nil, err
+			}
+		}
+		out = make([]any, numRows)
+		for i := range out {
+			row := make(map[string]any, numCols)
+			for c, name := range names {
+				row[name] = cells[uint64(c)*numRows+uint64(i)]
+			}
+			out[i] = row
+		}
 	}
 	if pos != end {
 		return nil, bad("trailing bytes in tabular payload")
-	}
-
-	out := make([]any, len(rows))
-	for i, r := range rows {
-		out[i] = r
 	}
 	return out, nil
 }

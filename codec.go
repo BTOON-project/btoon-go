@@ -156,6 +156,12 @@ func (zlibCodec) Compress(src []byte, level int) ([]byte, error) {
 }
 
 func (zlibCodec) Decompress(src []byte, size int) ([]byte, error) {
+	// RFC 1950 lets a stream require a preset dictionary (FLG.FDICT). BTOON
+	// has no way to supply one, so such a stream is corrupt. compress/zlib
+	// would accept it when DICTID is 1, the Adler-32 of an empty dictionary.
+	if len(src) >= 2 && src[1]&0x20 != 0 {
+		return nil, errors.New("zlib stream requires a preset dictionary, which BTOON does not support")
+	}
 	br := bytes.NewReader(src)
 	zr, err := zlib.NewReader(br)
 	if err != nil {

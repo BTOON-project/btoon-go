@@ -19,7 +19,7 @@ implementation. Decoding is **hardened** against hostile input.
 
 |                     |                                                                           |
 |---------------------|---------------------------------------------------------------------------|
-| Library version     | `0.1.1` (`btoon.Version`)                                                 |
+| Library version     | `0.1.2` (`btoon.Version`)                                                 |
 | Specification       | BTOON **0.1** (`btoon.SpecVersion`), [SPEC.md](https://github.com/BTOON-project/btoon-core/blob/main/docs/SPEC.md) |
 | Go                  | 1.25 or later                                                             |
 | Dependencies        | none in package `btoon` (standard library only); see [Compression](#compression) for the optional `codecs` package |

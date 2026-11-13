@@ -30,11 +30,12 @@
 // VectorF64, Ext); Unmarshal stores the document in a typed Go value. Both
 // are hardened against hostile input as SPEC §7 requires: every read is
 // bounds-checked, nesting is limited (128 by default), nothing is allocated
-// before checking that the remaining input could hold it, strings and keys
-// must be valid UTF-8, duplicate keys are rejected, and compression
-// envelopes are checked against a size limit (256 MiB by default) before
-// and while decompressing. Signed envelopes are verified, in constant time,
-// before the payload is parsed.
+// before checking that the remaining input could hold it, all that
+// containers reserve before their elements arrive is bounded by the size of
+// the document, strings and keys must be valid UTF-8, duplicate keys are
+// rejected, and compression envelopes are checked against a size limit
+// (256 MiB by default) before and while decompressing. Signed envelopes are
+// verified, in constant time, before the payload is parsed.
 //
 // # Errors
 //

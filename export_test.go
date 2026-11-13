@@ -21,3 +21,12 @@ func SwapCodecForTest(c Compression, codec Codec) (restore func()) {
 		}
 	}
 }
+
+// DecodeWithoutBudgetForTest decodes a bare document as if the document's
+// reservation budget were already spent, so that every container takes the
+// path for headers that announce more elements than the budget covers.
+func DecodeWithoutBudgetForTest(doc []byte) (any, error) {
+	d := newDecoder(doc, true, DefaultMaxDepth, false)
+	d.budget = 0
+	return d.document()
+}
