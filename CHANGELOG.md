@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.2.0 (2026-11-13)
+## 0.2.0 (2026-11-14)
 
 Implements BTOON spec 0.2 (`SpecVersion` is now `"0.2"`; decisions D23–D26 in the
 workspace's docs/DECISIONS.md). The wire format is unchanged: every valid 0.1 document
