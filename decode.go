@@ -14,7 +14,9 @@ import (
 //   - nothing is allocated for a container before checking that the
 //     remaining input could hold its elements, and what all containers
 //     allocate before their elements are decoded is bounded by the size of
-//     the document (see reserve).
+//     the document (see reserve);
+//   - the document decodes to at most max_values values (see value), which
+//     bounds the memory the decoded value takes (SPEC §7.1).
 type decoder struct {
 	data      []byte
 	pos       int
@@ -22,11 +24,31 @@ type decoder struct {
 	maxDepth  int
 	timeTypes bool // decode timestamps/dates/datetimes as Timestamp/Date/DateTime
 	budget    int  // slots containers may still reserve up front (see reserve)
+	values    int  // values the document may still decode to (max_values)
+	// maxNameBytes bounds rows × column-name bytes of a tabular array
+	// (max_decompressed_size, SPEC §5.6.3).
+	maxNameBytes uint64
 }
 
 // newDecoder returns a decoder for the bare document data.
-func newDecoder(data []byte, strict bool, maxDepth int, timeTypes bool) decoder {
-	return decoder{data: data, strict: strict, maxDepth: maxDepth, timeTypes: timeTypes, budget: len(data)}
+func newDecoder(data []byte, c *decodeConfig) decoder {
+	return decoder{
+		data: data, strict: c.strict, maxDepth: c.maxDepth, timeTypes: c.timeTypes,
+		budget: len(data), values: c.maxValues, maxNameBytes: uint64(c.maxDecompressed),
+	}
+}
+
+// count charges n values against max_values (SPEC §7.1).
+func (d *decoder) count(n uint64, offset int) error {
+	if n > uint64(d.values) {
+		return errTooManyValues(offset)
+	}
+	d.values -= int(n)
+	return nil
+}
+
+func errTooManyValues(offset int) error {
+	return errorAt(CodeSizeLimit, "the document decodes to more values than max_values allows", offset)
 }
 
 // reserve returns how many slots a container that announces n elements may
@@ -42,8 +64,13 @@ func newDecoder(data []byte, strict bool, maxDepth int, timeTypes bool) decoder 
 // valid document never use more than the budget, and only containers that
 // announce more elements than they hold make others grow. Reservations
 // therefore stay proportional to the input at any nesting depth.
+//
+// Each element is also a value (SPEC §7.1), so a container that announces
+// more elements than max_values has left fails before it fills its slots.
+// It doesn't reserve them either: a slot takes 16 bytes, and a 64 MiB
+// document announcing 64 Mi elements would otherwise reserve 1 GiB.
 func (d *decoder) reserve(n uint64) int {
-	if n > uint64(d.budget) {
+	if n > uint64(d.budget) || n > uint64(d.values) {
 		return 0
 	}
 	d.budget -= int(n)
@@ -123,6 +150,12 @@ func (d *decoder) document() (any, error) {
 }
 
 func (d *decoder) value(depth int) (any, error) {
+	// A value counts when it starts, before its marker is examined and
+	// before any value inside it (SPEC §7.1).
+	if d.values == 0 {
+		return nil, errTooManyValues(d.pos)
+	}
+	d.values--
 	if d.pos >= len(d.data) {
 		return nil, d.errTruncated()
 	}
@@ -251,6 +284,8 @@ func (d *decoder) str(n uint64) (string, error) {
 		return "", err
 	}
 	b := d.data[d.pos : d.pos+int(n)]
+	// Non-strict mode skips UTF-8 validation of string values only; keys
+	// and column names are always checked.
 	if d.strict && !utf8.Valid(b) {
 		return "", errorAt(CodeInvalidUTF8, "string is not valid UTF-8", d.pos)
 	}
@@ -344,7 +379,18 @@ func (d *decoder) key() (string, error) {
 	default:
 		return "", errorAt(CodeNonStringKey, "map key is not a string", d.pos)
 	}
-	return d.str(n)
+	if err := d.need(n); err != nil {
+		return "", err
+	}
+	b := d.data[d.pos : d.pos+int(n)]
+	// Keys must be UTF-8 in non-strict mode too. Keys are compared by their
+	// bytes, and replacing invalid sequences could merge two keys that
+	// differ on the wire (SPEC §7).
+	if !utf8.Valid(b) {
+		return "", errorAt(CodeInvalidUTF8, "map key is not valid UTF-8", d.pos)
+	}
+	d.pos += int(n)
+	return string(b), nil
 }
 
 // ext decodes an extension whose payload is n bytes long; d.pos is at the
@@ -506,22 +552,27 @@ func (d *decoder) tabular(start, end, depth, extPos int) (any, error) {
 		return nil, bad("tabular column count exceeds the payload")
 	}
 
+	// Names are checked front to back (SPEC §5.6.3): each must be valid
+	// UTF-8, in non-strict mode too, and differ from every earlier name. The
+	// first name that fails determines the error.
 	names := make([]string, numCols)
 	var seen map[string]struct{}
 	if numCols > 1 {
 		seen = make(map[string]struct{}, numCols)
 	}
+	var nameBytes uint64
 	for i := range names {
 		l, ok := u32()
 		if !ok || l > left() {
 			return nil, bad("tabular column name runs past the payload")
 		}
 		nb := p[pos : pos+int(l)]
-		if d.strict && !utf8.Valid(nb) {
+		if !utf8.Valid(nb) {
 			return nil, errorAt(CodeInvalidUTF8, "column name is not valid UTF-8", pos)
 		}
 		pos += int(l)
 		names[i] = string(nb)
+		nameBytes += l
 		if seen != nil {
 			if _, dup := seen[names[i]]; dup {
 				return nil, bad("duplicate column name " + quote(names[i]))
@@ -534,28 +585,39 @@ func (d *decoder) tabular(start, end, depth, extPos int) (any, error) {
 	}
 	pos += int(numCols) // type codes are informational (SPEC §5.6.1)
 
-	// Every cell is at least one byte, so N×C cells must fit in what is
-	// left.
+	// Then, in this order (SPEC §5.6.3): every cell is at least one byte, so
+	// N×C cells must fit in what is left;
 	numCells := numRows * numCols
 	if numCells > left() {
 		return nil, bad("tabular row count exceeds the payload")
 	}
+	// each row map holds every column name, so rows × name bytes is bounded
+	// as a plain array of maps would be (both factors are below 2^32);
+	if numRows*nameBytes > d.maxNameBytes {
+		return nil, errorAt(CodeSizeLimit, "tabular column names copied into every row exceed max_decompressed_size", pos)
+	}
+	// and the N row maps count against max_values. Each cell counts as it
+	// starts.
+	if err := d.count(numRows, pos); err != nil {
+		return nil, err
+	}
 	// Each column is decoded by its own decoder, bounded by the column's
-	// length and sharing the document's budget.
+	// length and sharing the document's reservation and value budgets.
 	openColumn := func() (col decoder, colEnd int, err error) {
 		colLen, ok := u32()
 		if !ok || colLen > left() {
 			return decoder{}, 0, bad("tabular column runs past the payload")
 		}
 		colEnd = pos + int(colLen)
-		col = decoder{data: d.data[:colEnd], pos: pos, strict: d.strict, maxDepth: d.maxDepth, timeTypes: d.timeTypes, budget: d.budget}
+		col = *d
+		col.data, col.pos = d.data[:colEnd], pos
 		return col, colEnd, nil
 	}
 	closeColumn := func(col *decoder, colEnd int) error {
 		if col.pos != colEnd {
 			return errorAt(CodeInvalidTabular, "tabular column length does not match its values", col.pos)
 		}
-		d.budget = col.budget
+		d.budget, d.values = col.budget, col.values
 		pos = colEnd
 		return nil
 	}

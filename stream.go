@@ -68,8 +68,10 @@ func (d *Decoder) More() bool {
 
 // Decode reads the next document and stores it in the value pointed to by
 // v, as Unmarshal would; v may also be a pointer to an interface value to
-// get the dynamic value. At the end of the stream Decode returns io.EOF; a
-// stream that ends inside a document fails with CodeTruncated.
+// get the dynamic value. At the end of the stream Decode returns io.EOF. A
+// stream that ends inside a document fails as Decode fails on the bytes it
+// holds: with CodeTruncated, unless the decoder finds an error first, such
+// as a value past MaxValues (SPEC §7.1).
 func (d *Decoder) Decode(v any) error {
 	rv := reflect.ValueOf(v)
 	if rv.Kind() != reflect.Pointer || rv.IsNil() {
@@ -84,6 +86,16 @@ func (d *Decoder) Decode(v any) error {
 	}
 	doc, err := d.next()
 	if err != nil {
+		var be *Error
+		if !errors.As(err, &be) || be.Code != CodeTruncated {
+			return err
+		}
+		// The stream ended inside a document. Report what Decode reports
+		// for the same bytes: the decoder may find an error before the end,
+		// or count a value past MaxValues as the input ends (SPEC §7.1).
+		if _, derr := cfg.decodeBare(d.buf, false); derr != nil {
+			return derr
+		}
 		return err
 	}
 	src, err := cfg.decodeBare(doc, false)

@@ -19,11 +19,11 @@ implementation. Decoding is **hardened** against hostile input.
 
 |                     |                                                                           |
 |---------------------|---------------------------------------------------------------------------|
-| Library version     | `0.1.2` (`btoon.Version`)                                                 |
-| Specification       | BTOON **0.1** (`btoon.SpecVersion`), [SPEC.md](https://github.com/BTOON-project/btoon-core/blob/main/docs/SPEC.md) |
+| Library version     | `0.2.0` (`btoon.Version`)                                                 |
+| Specification       | BTOON **0.2** (`btoon.SpecVersion`), [SPEC.md](https://github.com/BTOON-project/btoon-core/blob/main/docs/SPEC.md) |
 | Go                  | 1.25 or later                                                             |
 | Dependencies        | none in package `btoon` (standard library only); see [Compression](#compression) for the optional `codecs` package |
-| Conformance         | all 260 vectors of btoon-core's `btoon-vectors.json` (vendored in `testdata/`) pass; the zstd, lz4 and brotli vectors need the `codecs` package |
+| Conformance         | all 298 vectors of btoon-core's `btoon-vectors.json` (vendored in `testdata/`) pass; the zstd, lz4 and brotli vectors need the `codecs` package |
 
 ## Install
 
@@ -89,9 +89,9 @@ for {
 ```
 
 Stream documents are bare: compression and signed envelopes can't be used in a stream,
-because their magic bytes are also the start of a valid document. The stream decoder
-buffers one document at a time, so bound untrusted input (for example with
-`io.LimitReader`).
+because their magic bytes are also the start of a valid document. Each document has its
+own [`MaxValues`](#limits) budget. The stream decoder buffers one document at a time,
+so bound untrusted input (for example with `io.LimitReader`).
 
 See [`examples/basic`](examples/basic/main.go) and the
 [package documentation](https://pkg.go.dev/github.com/BTOON-project/btoon-go) for more.
@@ -186,25 +186,46 @@ strings fit into `string` and `[]byte`; time values fit into `time.Time`, `Times
 | `Compression` | `btoon.Zlib` | `Zlib`, `LZ4`, `Zstd`, `Brotli` or `Snappy`. Unregistered algorithms fail with `unsupported_compression`. |
 | `CompressionLevel` | 0 | Passed to the codec; 0 is the codec's default. |
 | `DisableTabular` | false | Never use the tabular encoding (the cross-language `auto_tabular = false`). |
-| `MaxDepth` | 128 | Nesting limit; deeper values and cyclic data fail with `max_depth`. |
-| `HMACKey` | nil | Sign the output (SPEC §8). An empty non-nil key is an error. |
+| `MaxDepth` | 128 | Nesting limit; deeper values and cyclic data fail with `max_depth`. At most 1000 (`btoon.MaxDepthLimit`); more is `invalid_argument`. |
+| `HMACKey` | nil | Sign the output (SPEC §8). An empty non-nil key is `invalid_argument`. |
 | `PreserveTimeOffset` | false | Write a `time.Time` in a non-UTC location with its UTC offset (the 14-byte timestamp form). |
 
 `DecodeOptions`:
 
 | Field | Default | Meaning |
 |---|---|---|
-| `NonStrict` | false | SPEC §7 non-strict mode: allow trailing bytes and duplicate keys (last wins), skip UTF-8 validation. Bounds, depth and allocation checks still apply. |
-| `MaxDepth` | 128 | Nesting limit. A tabular array counts as two levels. |
-| `MaxDecompressedSize` | 256 MiB | Largest accepted `uncompressed_size` of a compression envelope. |
+| `NonStrict` | false | SPEC §7 non-strict mode: allow trailing bytes and duplicate keys (last wins), and skip UTF-8 validation of string values. Map keys and column names must still be UTF-8, and bounds, depth, size and allocation checks still apply. |
+| `MaxDepth` | 128 | Nesting limit. A tabular array counts as two levels. At most 1000 (`btoon.MaxDepthLimit`); more is `invalid_argument`. |
+| `MaxDecompressedSize` | 64 MiB | Largest accepted `uncompressed_size` of a compression envelope, and the most column-name bytes a table may copy into its rows (rows × the names' total length). See [Limits](#limits). |
+| `MaxValues` | 2^20 (1,048,576) | Most values a document may decode to, counting tabular rows and cells; map keys don't count. See [Limits](#limits). |
 | `DisableDecompression` | false | Reject compression envelopes (the cross-language `auto_decompress = false`). |
-| `HMACKey` | nil | Require a signed envelope and verify it before parsing. |
+| `HMACKey` | nil | Require a signed envelope and verify it before parsing. An empty non-nil key is `invalid_argument`. |
 | `PreserveTimeTypes` | false | Decode time extensions as `Timestamp`, `Date`, `DateTime`. |
 | `DisallowUnknownFields` | false | `Unmarshal` fails on map keys without a matching struct field. |
 
 Go options are struct fields whose zero value is the default, so the cross-language
 options that default to true appear inverted (`DisableTabular`, `NonStrict`,
-`DisableDecompression`).
+`DisableDecompression`). For the same reason a limit of 0 means the default; negative
+limits are `invalid_argument`.
+
+### Limits
+
+A few kilobytes of compressed input can describe gigabytes of decoded values. SPEC §7.1
+bounds that with two decode limits; exceeding either fails with `size_limit`:
+
+- `MaxValues` (default 2^20) bounds how many values a document decodes to. Each value
+  counts once when it starts: the top-level value, every array element, map value and
+  extension, every tabular row (counted together once the table's header is checked)
+  and every cell. Map keys don't count, and neither do envelopes, but the values inside
+  a compression envelope do.
+- A table copies its column names into every row, so rows × the names' total byte
+  length must stay within `MaxDecompressedSize` (default 64 MiB), which also bounds the
+  `uncompressed_size` of a compression envelope.
+
+With the defaults, decoding takes at most about 210 MB (a table of half a million
+one-cell rows, which 600 bytes of zlib can describe). Applications that decode large tables raise
+`MaxValues`; applications that decode untrusted input should keep the defaults or lower
+them.
 
 ## Compression
 
@@ -261,7 +282,7 @@ if errors.Is(err, btoon.ErrAuthenticationFailed) { ... }
 | `invalid_extension` | A malformed BTOON extension payload |
 | `invalid_tabular` | A malformed tabular payload |
 | `invalid_envelope` | A malformed envelope, or a compressed payload that is corrupt or has the wrong size |
-| `size_limit` | A size above a limit, such as `MaxDecompressedSize` |
+| `size_limit` | A size above a limit: `MaxDecompressedSize`, `MaxValues`, or a table's rows × column-name bytes |
 | `unsupported_compression` | No codec is registered for the algorithm |
 | `authentication_failed` | Bad or missing signature, or a signed document decoded without a key |
 

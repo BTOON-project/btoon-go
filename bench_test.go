@@ -66,6 +66,18 @@ func BenchmarkDecodeRecords(b *testing.B) {
 	}
 }
 
+// The same records as plain maps, without the tabular encoding.
+func BenchmarkDecodeRecordsPlain(b *testing.B) {
+	data, _ := btoon.MarshalWithOptions(benchRecords(1000), btoon.EncodeOptions{DisableTabular: true})
+	b.SetBytes(int64(len(data)))
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		if _, err := btoon.Decode(data); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
 func BenchmarkMarshalRecordsZlib(b *testing.B) {
 	recs := benchRecords(1000)
 	b.ReportAllocs()

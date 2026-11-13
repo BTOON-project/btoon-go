@@ -26,7 +26,11 @@ func SwapCodecForTest(c Compression, codec Codec) (restore func()) {
 // reservation budget were already spent, so that every container takes the
 // path for headers that announce more elements than the budget covers.
 func DecodeWithoutBudgetForTest(doc []byte) (any, error) {
-	d := newDecoder(doc, true, DefaultMaxDepth, false)
+	cfg, err := (&DecodeOptions{}).config()
+	if err != nil {
+		return nil, err
+	}
+	d := newDecoder(doc, &cfg)
 	d.budget = 0
 	return d.document()
 }

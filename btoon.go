@@ -7,20 +7,25 @@ import (
 
 const (
 	// Version is the version of this library.
-	Version = "0.1.2"
+	Version = "0.2.0"
 	// SpecVersion is the version of the BTOON specification it implements.
-	SpecVersion = "0.1"
+	SpecVersion = "0.2"
 )
 
 const (
 	// DefaultMaxDepth is the default nesting limit (SPEC §7).
 	DefaultMaxDepth = 128
+	// MaxDepthLimit is the largest MaxDepth that EncodeOptions and
+	// DecodeOptions accept (SPEC §7). A larger one fails with
+	// CodeInvalidArgument, because deeper nesting could exhaust the stack.
+	MaxDepthLimit = 1000
 	// DefaultMaxDecompressedSize is the default limit for the uncompressed
-	// size of a compression envelope (SPEC §6): 256 MiB.
-	DefaultMaxDecompressedSize = 256 << 20
-	// maxMaxDepth keeps a caller-supplied MaxDepth from allowing recursion
-	// deep enough to exhaust the goroutine stack.
-	maxMaxDepth = 1 << 16
+	// size of a compression envelope (SPEC §6, §7.1): 64 MiB. It also bounds
+	// the column-name bytes a tabular array copies into its rows.
+	DefaultMaxDecompressedSize = 64 << 20
+	// DefaultMaxValues is the default limit for the number of values a
+	// document decodes to (SPEC §7.1): 2^20.
+	DefaultMaxValues = 1 << 20
 )
 
 // EncodeOptions configure MarshalWithOptions. The zero value gives the
@@ -41,8 +46,9 @@ type EncodeOptions struct {
 	// maps (SPEC §5.6). It is the inverse of the cross-language
 	// auto_tabular option, so that the zero value is the default.
 	DisableTabular bool
-	// MaxDepth limits container nesting. 0 means DefaultMaxDepth. Deeper
-	// values and cyclic data structures fail with CodeMaxDepth.
+	// MaxDepth limits container nesting. 0 means DefaultMaxDepth, and more
+	// than MaxDepthLimit is an error. Deeper values and cyclic data
+	// structures fail with CodeMaxDepth.
 	MaxDepth int
 	// HMACKey, if not nil, signs the output with HMAC-SHA256 (SPEC §8). It
 	// must not be empty, and should be at least 32 random bytes.
@@ -54,18 +60,30 @@ type EncodeOptions struct {
 }
 
 // DecodeOptions configure DecodeWithOptions and UnmarshalWithOptions. The
-// zero value gives the defaults: strict mode, depth 128, 256 MiB envelope
-// limit, compression envelopes accepted.
+// zero value gives the defaults: strict mode, depth 128, a 64 MiB envelope
+// limit, at most 2^20 values, compression envelopes accepted.
 type DecodeOptions struct {
 	// NonStrict selects SPEC §7 non-strict mode: trailing bytes are
-	// ignored, duplicate map keys are allowed (the last one wins) and UTF-8
-	// is not validated. Bounds, depth and allocation checks still apply.
+	// ignored, duplicate map keys are allowed (the last one wins) and string
+	// values are not checked for valid UTF-8. Map keys and tabular column
+	// names must be valid UTF-8 in both modes, and bounds, depth, size and
+	// allocation checks still apply.
 	NonStrict bool
-	// MaxDepth limits container nesting. 0 means DefaultMaxDepth.
+	// MaxDepth limits container nesting. 0 means DefaultMaxDepth, and more
+	// than MaxDepthLimit is an error.
 	MaxDepth int
 	// MaxDecompressedSize limits the uncompressed size of a compression
-	// envelope. 0 means DefaultMaxDecompressedSize.
+	// envelope, and the column-name bytes a tabular array copies into its
+	// rows (rows × the sum of the column names' lengths, SPEC §7.1). 0 means
+	// DefaultMaxDecompressedSize. Exceeding it fails with CodeSizeLimit.
 	MaxDecompressedSize int
+	// MaxValues limits how many values a document decodes to (SPEC §7.1).
+	// Every value counts: the top-level value, array elements, map values,
+	// extensions, tabular rows and cells, including those inside a
+	// compression envelope. Map keys don't. 0 means DefaultMaxValues.
+	// Exceeding it fails with CodeSizeLimit. Raise it to decode large
+	// tables; keep the default, or lower it, for untrusted input.
+	MaxValues int
 	// DisableDecompression rejects compression envelopes with
 	// CodeInvalidEnvelope (the cross-language auto_decompress = false).
 	DisableDecompression bool
@@ -117,6 +135,11 @@ func Marshal(v any) ([]byte, error) {
 // and/or signed envelope when requested (layered as
 // sign(compress(encode(v))), SPEC §8).
 func MarshalWithOptions(v any, o EncodeOptions) ([]byte, error) {
+	// An empty key is a configuration error, not "no key" (SPEC §8). Like
+	// the other options, it fails before v is looked at.
+	if o.HMACKey != nil && len(o.HMACKey) == 0 {
+		return nil, newError(CodeInvalidArgument, "HMACKey is empty")
+	}
 	out, err := encodeBare(v, &o)
 	if err != nil {
 		return nil, err
@@ -127,9 +150,6 @@ func MarshalWithOptions(v any, o EncodeOptions) ([]byte, error) {
 		}
 	}
 	if o.HMACKey != nil {
-		if len(o.HMACKey) == 0 {
-			return nil, newError(CodeInvalidArgument, "HMACKey is empty")
-		}
 		out = signDocument(out, o.HMACKey)
 	}
 	return out, nil
@@ -173,8 +193,11 @@ func encodeBare(v any, o *EncodeOptions) ([]byte, error) {
 //
 // Decode is strict (SPEC §7): it rejects trailing bytes, invalid UTF-8,
 // duplicate keys and malformed extensions, and never allocates much more
-// than the input justifies. A signed document is rejected with
-// CodeAuthenticationFailed; use DecodeWithOptions with an HMACKey.
+// than the input justifies. A document that decodes to more than
+// DefaultMaxValues values, or whose envelope declares more than
+// DefaultMaxDecompressedSize bytes, fails with CodeSizeLimit (SPEC §7.1).
+// A signed document is rejected with CodeAuthenticationFailed; use
+// DecodeWithOptions with an HMACKey.
 func Decode(data []byte) (any, error) {
 	return DecodeWithOptions(data, DecodeOptions{})
 }
@@ -238,22 +261,26 @@ type decodeConfig struct {
 	strict          bool
 	maxDepth        int
 	maxDecompressed int
+	maxValues       int
 	noDecompress    bool
 	hmacKey         []byte
 	timeTypes       bool
 }
 
+// config checks o and applies the defaults. Options that can't be honored
+// fail before any input is read.
 func (o *DecodeOptions) config() (decodeConfig, error) {
 	maxDepth, err := resolveMaxDepth(o.MaxDepth)
 	if err != nil {
 		return decodeConfig{}, err
 	}
-	maxSize := o.MaxDecompressedSize
-	switch {
-	case maxSize < 0:
-		return decodeConfig{}, newError(CodeInvalidArgument, "MaxDecompressedSize is negative")
-	case maxSize == 0:
-		maxSize = DefaultMaxDecompressedSize
+	maxSize, err := resolveLimit("MaxDecompressedSize", o.MaxDecompressedSize, DefaultMaxDecompressedSize)
+	if err != nil {
+		return decodeConfig{}, err
+	}
+	maxValues, err := resolveLimit("MaxValues", o.MaxValues, DefaultMaxValues)
+	if err != nil {
+		return decodeConfig{}, err
 	}
 	if o.HMACKey != nil && len(o.HMACKey) == 0 {
 		return decodeConfig{}, newError(CodeInvalidArgument, "HMACKey is empty")
@@ -262,6 +289,7 @@ func (o *DecodeOptions) config() (decodeConfig, error) {
 		strict:          !o.NonStrict,
 		maxDepth:        maxDepth,
 		maxDecompressed: maxSize,
+		maxValues:       maxValues,
 		noDecompress:    o.DisableDecompression,
 		hmacKey:         o.HMACKey,
 		timeTypes:       o.PreserveTimeTypes,
@@ -269,9 +297,10 @@ func (o *DecodeOptions) config() (decodeConfig, error) {
 }
 
 // decodeBare decodes a bare document. If whole is false, trailing bytes are
-// never an error.
+// never an error. Each call has its own max_values budget, so every
+// document of a stream has one.
 func (c *decodeConfig) decodeBare(doc []byte, whole bool) (any, error) {
-	d := newDecoder(doc, c.strict, c.maxDepth, c.timeTypes)
+	d := newDecoder(doc, c)
 	if whole {
 		return d.document()
 	}
@@ -284,8 +313,20 @@ func resolveMaxDepth(n int) (int, error) {
 		return DefaultMaxDepth, nil
 	case n < 0:
 		return 0, newError(CodeInvalidArgument, "MaxDepth is negative")
-	case n > maxMaxDepth:
-		return 0, newError(CodeInvalidArgument, "MaxDepth above "+strconv.Itoa(maxMaxDepth))
+	case n > MaxDepthLimit:
+		return 0, newError(CodeInvalidArgument, "MaxDepth "+strconv.Itoa(n)+" is above "+strconv.Itoa(MaxDepthLimit))
+	}
+	return n, nil
+}
+
+// resolveLimit applies the default of a size limit whose zero value means
+// the default.
+func resolveLimit(name string, n, def int) (int, error) {
+	switch {
+	case n < 0:
+		return 0, newError(CodeInvalidArgument, name+" is negative")
+	case n == 0:
+		return def, nil
 	}
 	return n, nil
 }
