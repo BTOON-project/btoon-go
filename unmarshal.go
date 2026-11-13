@@ -49,6 +49,10 @@ func (a *assigner) mismatch(src any, t reflect.Type, why string) error {
 	return newError(CodeTypeMismatch, msg+a.location())
 }
 
+// maxDescribedBits is the size of the largest integer that error messages
+// show in decimal (at most 39 digits).
+const maxDescribedBits = 128
+
 // describeValue names the BTOON type of a decoded value for error messages.
 func describeValue(v any) string {
 	switch x := v.(type) {
@@ -61,11 +65,17 @@ func describeValue(v any) string {
 	case uint64:
 		return "integer " + utoa(x)
 	case *big.Int:
-		s := x.String()
-		if len(s) > 40 {
-			s = s[:20] + "..." + s[len(s)-17:]
+		// A decoded bigint can have millions of digits, and converting it to
+		// decimal takes time superlinear in its length (seconds for an 8 MiB
+		// bigint, which fits in an 8 KB envelope). Larger values are
+		// described by their size.
+		if n := x.BitLen(); n > maxDescribedBits {
+			if x.Sign() < 0 {
+				return "negative integer of " + strconv.Itoa(n) + " bits"
+			}
+			return "integer of " + strconv.Itoa(n) + " bits"
 		}
-		return "integer " + s
+		return "integer " + x.String()
 	case float64:
 		return "float " + strconv.FormatFloat(x, 'g', -1, 64)
 	case string:

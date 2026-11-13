@@ -88,6 +88,11 @@ func TestStreamTypedAndErrors(t *testing.T) {
 	wantErrCode(t, enc.Encode(1), btoon.CodeInvalidArgument)
 	dec.SetOptions(btoon.DecodeOptions{HMACKey: []byte("k")})
 	wantErrCode(t, dec.Decode(&x), btoon.CodeInvalidArgument)
+	// An empty key is not "no key" either (SPEC §8).
+	enc.SetOptions(btoon.EncodeOptions{HMACKey: []byte{}})
+	wantErrCode(t, enc.Encode(1), btoon.CodeInvalidArgument)
+	dec.SetOptions(btoon.DecodeOptions{HMACKey: []byte{}})
+	wantErrCode(t, dec.Decode(&x), btoon.CodeInvalidArgument)
 	wantErrCode(t, btoon.NewDecoder(&buf).Decode(x), btoon.CodeInvalidArgument)
 
 	// A reader error is passed through.

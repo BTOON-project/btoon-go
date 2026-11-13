@@ -324,11 +324,23 @@ func TestSignedEnvelope(t *testing.T) {
 	_, err = btoon.DecodeWithOptions(signed[:39], btoon.DecodeOptions{HMACKey: key})
 	wantErrCode(t, err, btoon.CodeInvalidEnvelope)
 
-	// An empty, non-nil key is a configuration error, not "no key".
+	// An empty, non-nil key is a configuration error, not "no key" (SPEC §8):
+	// every entry point rejects it, even where the input isn't signed.
 	_, err = btoon.MarshalWithOptions(doc, btoon.EncodeOptions{HMACKey: []byte{}})
 	wantErrCode(t, err, btoon.CodeInvalidArgument)
-	_, err = btoon.DecodeWithOptions(signed, btoon.DecodeOptions{HMACKey: []byte{}})
+	_, err = btoon.MarshalWithOptions(doc, btoon.EncodeOptions{HMACKey: []byte(""), Compress: true})
 	wantErrCode(t, err, btoon.CodeInvalidArgument)
+	for _, in := range [][]byte{signed, mustMarshal(t, doc)} {
+		_, err = btoon.DecodeWithOptions(in, btoon.DecodeOptions{HMACKey: []byte{}})
+		wantErrCode(t, err, btoon.CodeInvalidArgument)
+		var m map[string]any
+		err = btoon.UnmarshalWithOptions(in, &m, btoon.DecodeOptions{HMACKey: []byte{}})
+		wantErrCode(t, err, btoon.CodeInvalidArgument)
+	}
+	// "No key" is a nil slice.
+	if v, err := btoon.DecodeWithOptions(mustMarshal(t, doc), btoon.DecodeOptions{HMACKey: nil}); err != nil || !reflect.DeepEqual(v, doc) {
+		t.Fatalf("nil key: %v %v", v, err)
+	}
 
 	// Signed and compressed: sign(compress(encode(v))).
 	both, err := btoon.MarshalWithOptions(bigDoc(), btoon.EncodeOptions{HMACKey: key, Compress: true})
@@ -340,5 +352,19 @@ func TestSignedEnvelope(t *testing.T) {
 	}
 	if _, err := btoon.DecodeWithOptions(both, btoon.DecodeOptions{HMACKey: key}); err != nil {
 		t.Fatal(err)
+	}
+}
+
+// RFC 1950 lets a zlib stream ask for a preset dictionary (FLG.FDICT). BTOON
+// has no way to supply one, so such a payload is invalid_envelope. Go's
+// compress/zlib accepted one whose DICTID is the Adler-32 of an empty
+// dictionary, while every other implementation rejected it (review X2).
+func TestZlibPresetDictionaryIsRejected(t *testing.T) {
+	// FLG = 0xbb (FDICT set), DICTID = 1, then the deflate stream of "hello".
+	_, err := btoon.Decode(fromHex(t, "42544f4e01000000000000120000000678bb000000015b9a919a93930f000a0b02ba"))
+	wantErrCode(t, err, btoon.CodeInvalidEnvelope)
+	// The same stream without FDICT and DICTID.
+	if v, err := btoon.Decode(fromHex(t, "42544f4e010000000000000e00000006789c5b9a919a93930f000a0b02ba")); err != nil || v != "hello" {
+		t.Fatalf("got %v %v", v, err)
 	}
 }

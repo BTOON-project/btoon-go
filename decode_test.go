@@ -1,8 +1,11 @@
 package btoon_test
 
 import (
+	"bytes"
+	"encoding/binary"
 	"errors"
 	"runtime"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -160,5 +163,155 @@ func TestDecodedTypes(t *testing.T) {
 	in[2] = 9
 	if v.([]byte)[0] != 1 {
 		t.Fatal("binary aliases the input")
+	}
+}
+
+// nestedArrays returns levels nested array32 headers, each announcing every
+// byte that follows it, then payload nils (review 2026-11-13, X1).
+func nestedArrays(levels, payload int) []byte {
+	doc := bytes.Repeat([]byte{0xc0}, levels*5+payload)
+	for i := 0; i < levels; i++ {
+		doc[i*5] = 0xdd
+		binary.BigEndian.PutUint32(doc[i*5+1:], uint32(len(doc)-i*5-5))
+	}
+	return doc
+}
+
+// nestedMaps returns levels nested map32 headers, each announcing half the
+// bytes that follow it and holding the next level under the key "". The
+// innermost map fails at its first key.
+func nestedMaps(levels, payload int) []byte {
+	doc := bytes.Repeat([]byte{0xc0}, levels*6+payload)
+	for i := 0; i < levels; i++ {
+		doc[i*6] = 0xdf
+		binary.BigEndian.PutUint32(doc[i*6+1:], uint32((len(doc)-i*6-5)/2))
+		doc[i*6+5] = 0xa0
+	}
+	return doc
+}
+
+// nestedTabulars returns levels nested tabulars with one column. The
+// innermost one has a single row holding a payload-byte binary; every outer
+// level announces as many rows as its payload could hold, but its column
+// holds only the next level.
+func nestedTabulars(levels, payload int) []byte {
+	level := func(cell []byte, rows int) []byte {
+		p := binary.BigEndian.AppendUint32(nil, 1)
+		p = binary.BigEndian.AppendUint32(p, 1)
+		p = binary.BigEndian.AppendUint32(p, uint32(rows))
+		p = binary.BigEndian.AppendUint32(p, 1)
+		p = append(p, 'a', 9)
+		p = binary.BigEndian.AppendUint32(p, uint32(len(cell)))
+		p = append(p, cell...)
+		out := binary.BigEndian.AppendUint32([]byte{0xc9}, uint32(len(p)))
+		return append(append(out, 0xf6), p...)
+	}
+	bin := binary.BigEndian.AppendUint32([]byte{0xc6}, uint32(payload))
+	doc := level(append(bin, make([]byte, payload)...), 1)
+	for i := 1; i < levels; i++ {
+		doc = level(doc, len(doc)+4)
+	}
+	return doc
+}
+
+// Nested containers used to reserve their announced length up front, each
+// level checked against the same remaining bytes. 127 nested array32 headers
+// in 1 MiB reserved 2 GiB, 127 map32 headers 5 GiB, and 64 nested tabulars
+// built 3.5 GiB of rows before failing (review 2026-11-13, X1). Reservations
+// now come out of one budget per document, the size of the document.
+func TestNestedContainersPreallocateBoundedMemory(t *testing.T) {
+	const payload = 64 << 10
+	for _, c := range []struct {
+		name string
+		doc  []byte
+		code string
+	}{
+		{"127 nested array32", nestedArrays(127, payload), btoon.CodeTruncated},
+		{"127 nested map32", nestedMaps(127, payload), btoon.CodeNonStringKey},
+		{"64 nested tabulars", nestedTabulars(64, payload), btoon.CodeInvalidTabular},
+	} {
+		runtime.GC()
+		var before, after runtime.MemStats
+		runtime.ReadMemStats(&before)
+		_, err := btoon.Decode(c.doc)
+		runtime.ReadMemStats(&after)
+		wantErrCode(t, err, c.code)
+		allocated := after.TotalAlloc - before.TotalAlloc
+		if limit := 16<<20 + 32*uint64(len(c.doc)); allocated > limit {
+			t.Errorf("%s: %d-byte input allocated %d MiB (limit %d MiB)", c.name, len(c.doc), allocated>>20, limit>>20)
+		}
+	}
+}
+
+// With MaxDepth raised to its limit, 65,535 nested array16 headers that each
+// announce 1,024 elements (198 KB) reserved 1.1 GiB. A fixed allowance per
+// container, as a fallback for when the budget runs out, would add up the
+// same way, so there is none: past the budget, containers start empty.
+func TestDeepNestingReservesWithinTheDocumentSize(t *testing.T) {
+	const levels = 1<<16 - 1
+	doc := bytes.Repeat([]byte{0xc0}, levels*3+1024)
+	for i := 0; i < levels; i++ {
+		copy(doc[i*3:], []byte{0xdc, 0x04, 0x00})
+	}
+	runtime.GC()
+	var before, after runtime.MemStats
+	runtime.ReadMemStats(&before)
+	_, err := btoon.DecodeWithOptions(doc, btoon.DecodeOptions{MaxDepth: 1 << 16})
+	runtime.ReadMemStats(&after)
+	wantErrCode(t, err, btoon.CodeTruncated)
+	if allocated := after.TotalAlloc - before.TotalAlloc; allocated > 32<<20 {
+		t.Errorf("%d-byte input allocated %d MiB", len(doc), allocated>>20)
+	}
+}
+
+// A valid document never spends more than its budget, so containers start
+// empty only when a header announces more elements than the document holds,
+// and the document fails to decode. Until it fails, those containers must
+// decode exactly as the others do.
+func TestContainersDecodeTheSameWithoutABudget(t *testing.T) {
+	var docs [][]byte
+	for _, v := range loadVectors(t).Vectors {
+		if v.Options.HMACKey == "" && !strings.HasPrefix(v.Hex, "42544f4e") && !strings.HasPrefix(v.Hex, "42545347") {
+			docs = append(docs, v.bytes(t))
+		}
+	}
+	// Containers larger than the doubling starts with, and tables with
+	// more cells, and more columns, than that.
+	for _, n := range []int{15, 16, 17, 1025, 70000} {
+		arr := make([]any, n)
+		m := make(map[string]any, n)
+		for i := range arr {
+			arr[i] = int64(i)
+			m["k"+strconv.Itoa(i)] = []any{int64(i)}
+		}
+		docs = append(docs, mustMarshal(t, arr), mustMarshal(t, m), mustMarshal(t, []any{arr, m}))
+	}
+	for _, shape := range [][2]int{{3000, 3}, {3, 1500}, {40, 20}} {
+		rows := make([]any, shape[0])
+		for r := range rows {
+			row := make(map[string]any, shape[1])
+			for c := 0; c < shape[1]; c++ {
+				row["c"+strconv.Itoa(c)] = []any{int64(r*shape[1] + c), "x"}
+			}
+			rows[r] = row
+		}
+		doc := mustMarshal(t, rows)
+		if !bytes.Contains(doc[:8], []byte{0xf6}) {
+			t.Fatalf("%v: not encoded as a table", shape)
+		}
+		docs = append(docs, doc)
+	}
+	for _, doc := range docs {
+		want, wantErr := btoon.Decode(doc)
+		got, err := btoon.DecodeWithoutBudgetForTest(doc)
+		var we, ge *btoon.Error
+		switch {
+		case wantErr != nil:
+			if !errors.As(wantErr, &we) || !errors.As(err, &ge) || we.Code != ge.Code || we.Offset != ge.Offset {
+				t.Errorf("% x: got %v, want %v", doc[:min(len(doc), 16)], err, wantErr)
+			}
+		case err != nil || !equalValues(got, want):
+			t.Errorf("% x: decoded differently (%v)", doc[:min(len(doc), 16)], err)
+		}
 	}
 }

@@ -7,7 +7,7 @@ import (
 
 const (
 	// Version is the version of this library.
-	Version = "0.1.1"
+	Version = "0.1.2"
 	// SpecVersion is the version of the BTOON specification it implements.
 	SpecVersion = "0.1"
 )
@@ -271,7 +271,7 @@ func (o *DecodeOptions) config() (decodeConfig, error) {
 // decodeBare decodes a bare document. If whole is false, trailing bytes are
 // never an error.
 func (c *decodeConfig) decodeBare(doc []byte, whole bool) (any, error) {
-	d := decoder{data: doc, strict: c.strict, maxDepth: c.maxDepth, timeTypes: c.timeTypes}
+	d := newDecoder(doc, c.strict, c.maxDepth, c.timeTypes)
 	if whole {
 		return d.document()
 	}
