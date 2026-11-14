@@ -270,7 +270,7 @@ func TestUnmarshalTabularIntoStructs(t *testing.T) {
 	f := loadVectors(t)
 	for _, v := range f.Vectors {
 		if v.ID == "tabular/in-map" {
-			if err := btoon.Unmarshal(v.bytes(t), &doc); err != nil {
+			if err := btoon.Unmarshal(v.Bytes(t), &doc); err != nil {
 				t.Fatal(err)
 			}
 		}

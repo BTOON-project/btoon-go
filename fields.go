@@ -23,7 +23,18 @@ var (
 	mapStringAnyType    = reflect.TypeFor[map[string]any]()
 	binaryMarshalerType = reflect.TypeFor[encoding.BinaryMarshaler]()
 	binaryUnmarshalType = reflect.TypeFor[encoding.BinaryUnmarshaler]()
+	textMarshalerType   = reflect.TypeFor[encoding.TextMarshaler]()
+	textUnmarshalType   = reflect.TypeFor[encoding.TextUnmarshaler]()
 	isZeroerType        = reflect.TypeFor[interface{ IsZero() bool }]()
+)
+
+// method is the marshaling method that Marshal uses for a type.
+type method uint8
+
+const (
+	methodNone   method = iota
+	methodBinary        // encoding.BinaryMarshaler: binary
+	methodText          // encoding.TextMarshaler: string
 )
 
 // special identifies Go types with a dedicated BTOON mapping.
@@ -44,12 +55,25 @@ const (
 // typeInfo caches what the encoder and decoder need to know about a type.
 type typeInfo struct {
 	special special
-	// marshaler: the type implements encoding.BinaryMarshaler.
-	marshaler bool
-	// addrMarshaler: only *T implements encoding.BinaryMarshaler.
-	addrMarshaler bool
-	// addrUnmarshaler: *T implements encoding.BinaryUnmarshaler.
-	addrUnmarshaler bool
+	// marshal is the method Marshal encodes the type with: BinaryMarshaler
+	// of the type or of a pointer to it, else, for a struct type,
+	// TextMarshaler (see textMethod).
+	marshal method
+	// marshalAddr: only *T has the marshal method. Marshal calls it on an
+	// addressable copy of a value that isn't addressable, so that the
+	// encoding doesn't depend on addressability (as in encoding/json/v2).
+	marshalAddr bool
+	// unmarshalBinary: *T implements encoding.BinaryUnmarshaler.
+	// unmarshalText: T is a struct type and *T implements
+	// encoding.TextUnmarshaler (see textMethod).
+	unmarshalBinary, unmarshalText bool
+	// native is the kind (specialTime or specialBigInt) of the time.Time or
+	// big.Int that a struct type embeds, by value or through pointers, at
+	// the shallowest embedding depth that has one, and nativeIndex is its
+	// index path. The struct's marshaling methods are usually promoted from
+	// it; see encoder.encodeMethod.
+	native      special
+	nativeIndex []int
 
 	fieldsOnce sync.Once
 	fields     *structFields
@@ -81,16 +105,110 @@ func typeInfoOf(t reflect.Type) *typeInfo {
 		ti.special = specialDateTime
 	}
 	if ti.special == specialNone && t.Kind() != reflect.Interface {
-		ti.marshaler = t.Implements(binaryMarshalerType)
-		if !ti.marshaler && t.Kind() != reflect.Pointer {
-			ti.addrMarshaler = reflect.PointerTo(t).Implements(binaryMarshalerType)
+		if t.Kind() == reflect.Struct {
+			ti.native, ti.nativeIndex = embeddedNative(t)
+		}
+		// The methods of *T include those of T.
+		pt := t
+		if t.Kind() != reflect.Pointer {
+			pt = reflect.PointerTo(t)
+		}
+		switch {
+		case pt.Implements(binaryMarshalerType):
+			ti.marshal, ti.marshalAddr = methodBinary, !t.Implements(binaryMarshalerType)
+		case textMethod(t, textMarshalerType, ti):
+			ti.marshal, ti.marshalAddr = methodText, !t.Implements(textMarshalerType)
 		}
 		if t.Kind() != reflect.Pointer {
-			ti.addrUnmarshaler = reflect.PointerTo(t).Implements(binaryUnmarshalType)
+			ti.unmarshalBinary = pt.Implements(binaryUnmarshalType)
+			ti.unmarshalText = textMethod(t, textUnmarshalType, ti)
 		}
 	}
 	actual, _ := typeInfoCache.LoadOrStore(t, ti)
 	return actual.(*typeInfo)
+}
+
+// textMethod reports whether Marshal or Unmarshal use the text method
+// iface (encoding.TextMarshaler or TextUnmarshaler) of type t. They do only
+// for a struct type, whose fields don't always hold its value (big.Float,
+// big.Rat). A type of another kind is encoded by its kind, as before 0.3,
+// so that net.IP stays binary and an integer enum stays an integer.
+//
+// For the same reason, they don't use a text method that a struct may get
+// from an embedded field: a struct that embeds net.IP is still a map of its
+// fields, as encoding it as the IP's text would drop the others. The
+// exception is an embedded big.Int, which Marshal then writes as an
+// integer (see encoder.encodeMethod).
+func textMethod(t, iface reflect.Type, ti *typeInfo) bool {
+	if t.Kind() != reflect.Struct || !reflect.PointerTo(t).Implements(iface) {
+		return false
+	}
+	for i := 0; i < t.NumField(); i++ {
+		sf := t.Field(i)
+		if !sf.Anonymous || !hasMethod(sf.Type, iface) {
+			continue
+		}
+		if iface == textMarshalerType && ti.native == specialBigInt && i == ti.nativeIndex[0] {
+			continue
+		}
+		return false
+	}
+	return true
+}
+
+// hasMethod reports whether a field of type t gives its struct the methods
+// of iface, with a value or a pointer receiver.
+func hasMethod(t, iface reflect.Type) bool {
+	if t.Implements(iface) {
+		return true
+	}
+	return t.Kind() != reflect.Pointer && t.Kind() != reflect.Interface && reflect.PointerTo(t).Implements(iface)
+}
+
+// embeddedNative finds the time.Time or big.Int that struct type t embeds
+// at the shallowest depth, through embedded structs and pointers to them,
+// and returns its kind and index path. Like a promoted method, it must be
+// the only one at that depth.
+func embeddedNative(t reflect.Type) (special, []int) {
+	type node struct {
+		typ   reflect.Type
+		index []int
+	}
+	level := []node{{t, nil}}
+	seen := map[reflect.Type]bool{t: true}
+	for len(level) > 0 {
+		var found, next []node
+		for _, n := range level {
+			for i := 0; i < n.typ.NumField(); i++ {
+				sf := n.typ.Field(i)
+				if !sf.Anonymous {
+					continue
+				}
+				ft := sf.Type
+				if ft.Kind() == reflect.Pointer {
+					ft = ft.Elem()
+				}
+				index := append(slices.Clip(n.index), i)
+				switch {
+				case ft == timeType || ft == bigIntType:
+					found = append(found, node{ft, index})
+				case ft.Kind() == reflect.Struct && !seen[ft]:
+					seen[ft] = true
+					next = append(next, node{ft, index})
+				}
+			}
+		}
+		switch {
+		case len(found) == 1 && found[0].typ == timeType:
+			return specialTime, found[0].index
+		case len(found) == 1:
+			return specialBigInt, found[0].index
+		case len(found) > 1:
+			return specialNone, nil // ambiguous, like the methods
+		}
+		level = next
+	}
+	return specialNone, nil
 }
 
 // structFieldsOf returns the BTOON fields of struct type t.
@@ -271,30 +389,37 @@ func hasOption(opts, name string) bool {
 // zeroFunc implements the omitzero option: a type's IsZero method if it has
 // one, otherwise reflect's notion of the zero value.
 func zeroFunc(t reflect.Type) func(reflect.Value) bool {
+	var isZero func(reflect.Value) bool
 	switch {
 	case t.Kind() == reflect.Interface && t.Implements(isZeroerType):
-		return func(v reflect.Value) bool {
-			return v.IsNil() || v.Interface().(interface{ IsZero() bool }).IsZero()
+		// As in encoding/json, an interface holding a nil pointer is zero:
+		// calling IsZero on it could panic.
+		isZero = func(v reflect.Value) bool {
+			return v.IsNil() || (v.Elem().Kind() == reflect.Pointer && v.Elem().IsNil()) ||
+				v.Interface().(interface{ IsZero() bool }).IsZero()
 		}
 	case t.Kind() == reflect.Pointer && t.Implements(isZeroerType):
-		return func(v reflect.Value) bool {
+		isZero = func(v reflect.Value) bool {
 			return v.IsNil() || v.Interface().(interface{ IsZero() bool }).IsZero()
 		}
 	case t.Implements(isZeroerType):
-		return func(v reflect.Value) bool {
+		isZero = func(v reflect.Value) bool {
 			return v.Interface().(interface{ IsZero() bool }).IsZero()
 		}
 	case reflect.PointerTo(t).Implements(isZeroerType):
-		return func(v reflect.Value) bool {
-			if !v.CanAddr() {
-				c := reflect.New(v.Type()).Elem()
-				c.Set(v)
-				v = c
-			}
-			return v.Addr().Interface().(interface{ IsZero() bool }).IsZero()
+		isZero = func(v reflect.Value) bool {
+			return addressable(v).Addr().Interface().(interface{ IsZero() bool }).IsZero()
 		}
 	default:
 		return reflect.Value.IsZero
+	}
+	return func(v reflect.Value) bool {
+		// Reflection can't call the methods of an embedded field of an
+		// unexported type that has a tag (see canCallMethods).
+		if !v.CanInterface() {
+			return v.IsZero()
+		}
+		return isZero(v)
 	}
 }
 

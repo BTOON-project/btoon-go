@@ -52,3 +52,5 @@ jobs:
           go-version: stable
       - name: Fuzz the decoder for 30s
         run: go test -run='^$' -fuzz=FuzzDecode -fuzztime=30s .
+      - name: Fuzz the LZ4 block decoder for 30s
+        run: go test -run='^$' -fuzz=FuzzLZ4Block -fuzztime=30s ./codecs

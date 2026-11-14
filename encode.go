@@ -1,6 +1,7 @@
 package btoon
 
 import (
+	"bytes"
 	"encoding"
 	"encoding/binary"
 	"math"
@@ -117,16 +118,8 @@ func (e *encoder) encodeConcrete(v reflect.Value, depth int) error {
 		return e.writeVectorF64(v.Interface().(VectorF64))
 	}
 
-	if ti.marshaler || (ti.addrMarshaler && v.CanAddr()) {
-		m := v
-		if !ti.marshaler {
-			m = v.Addr()
-		}
-		b, err := m.Interface().(encoding.BinaryMarshaler).MarshalBinary()
-		if err != nil {
-			return wrapError(CodeInvalidArgument, "MarshalBinary of "+v.Type().String()+" failed", err)
-		}
-		return e.writeBinary(b)
+	if ti.marshal != methodNone && canCallMethods(v) {
+		return e.encodeMethod(v, ti)
 	}
 
 	switch v.Kind() {
@@ -184,6 +177,97 @@ func (e *encoder) encodeConcrete(v reflect.Value, depth int) error {
 	return newError(CodeInvalidArgument, "unsupported Go type "+v.Type().String())
 }
 
+// canCallMethods reports whether Marshal and Unmarshal can call v's methods.
+// They can't for an embedded field of an unexported type that has a tag,
+// which reflection doesn't let them use (encoding/json panics there). Such a
+// field is encoded and decoded by its kind instead.
+func canCallMethods(v reflect.Value) bool { return v.CanInterface() }
+
+// encodeMethod encodes v with its MarshalBinary method, as binary, or with
+// its MarshalText method, as a string. A method with a pointer receiver is
+// called on an addressable copy of a value that isn't addressable, as
+// encoding/json/v2 does, so the result doesn't depend on addressability.
+//
+// A MarshalBinary promoted from an embedded field counts, as in
+// encoding/json: a struct that embeds a type with MarshalBinary has that
+// method itself, and encodes as its result, without its other fields (a
+// promoted MarshalText doesn't count; see textMethod). A struct that embeds
+// a time.Time or big.Int gets their marshaling methods too: MarshalBinary,
+// with time.Time's private binary format, and MarshalText, with big.Int's
+// decimal digits. encoding/json writes such a struct as the embedded value's
+// JSON; Marshal writes it as the embedded value's BTOON encoding instead, a
+// timestamp or an integer, or nil if the embedded pointer is nil. Reflection
+// can't tell a promoted method from one the struct declares, so Marshal
+// compares their results: a struct whose own method returns something else
+// is encoded with it.
+func (e *encoder) encodeMethod(v reflect.Value, ti *typeInfo) error {
+	var native reflect.Value
+	if ti.native != specialNone {
+		nv, ok := fieldByIndex(v, ti.nativeIndex)
+		if ok && nv.Kind() == reflect.Pointer {
+			ok = !nv.IsNil()
+			nv = nv.Elem()
+		}
+		if !ok {
+			// A method promoted through the nil pointer would panic.
+			e.buf = append(e.buf, 0xc0)
+			return nil
+		}
+		if canCallMethods(nv) {
+			native = nv
+		}
+	}
+
+	m := v
+	if ti.marshalAddr {
+		m = addressable(v).Addr()
+	}
+	var b []byte
+	var err error
+	name := "MarshalBinary"
+	if ti.marshal == methodBinary {
+		b, err = m.Interface().(encoding.BinaryMarshaler).MarshalBinary()
+	} else {
+		name = "MarshalText"
+		b, err = m.Interface().(encoding.TextMarshaler).MarshalText()
+	}
+	if err != nil {
+		return wrapError(CodeInvalidArgument, name+" of "+v.Type().String()+" failed", err)
+	}
+
+	if native.IsValid() {
+		switch ti.native {
+		case specialTime:
+			t := native.Interface().(time.Time)
+			var nb []byte
+			var nerr error
+			if ti.marshal == methodBinary {
+				nb, nerr = t.MarshalBinary()
+			} else {
+				nb, nerr = t.MarshalText()
+			}
+			if nerr == nil && bytes.Equal(b, nb) {
+				return e.writeTime(t)
+			}
+		case specialBigInt:
+			x := addressable(native).Addr().Interface().(*big.Int)
+			if ti.marshal == methodText {
+				if nb, nerr := x.MarshalText(); nerr == nil && bytes.Equal(b, nb) {
+					return e.writeBigInt(x)
+				}
+			}
+		}
+	}
+
+	if ti.marshal == methodBinary {
+		return e.writeBinary(b)
+	}
+	if !utf8.Valid(b) {
+		return newError(CodeInvalidUTF8, "MarshalText of "+v.Type().String()+" returned invalid UTF-8")
+	}
+	return e.writeString(string(b))
+}
+
 // asMap reports whether v (not a nil pointer or interface) encodes as a map,
 // and if so returns its entries in canonical key order.
 func asMap(v reflect.Value) ([]entry, bool, error) {
@@ -193,14 +277,14 @@ func asMap(v reflect.Value) ([]entry, bool, error) {
 			return nil, false, nil
 		}
 		ti := typeInfoOf(v.Type())
-		if ti.marshaler || ti.addrMarshaler && v.CanAddr() {
+		if ti.marshal != methodNone && canCallMethods(v) {
 			return nil, false, nil
 		}
 		ents, err := mapEntries(v)
 		return ents, err == nil, err
 	case reflect.Struct:
 		ti := typeInfoOf(v.Type())
-		if ti.special != specialNone || ti.marshaler || ti.addrMarshaler && v.CanAddr() {
+		if ti.special != specialNone || ti.marshal != methodNone && canCallMethods(v) {
 			return nil, false, nil
 		}
 		return structEntries(v), true, nil
@@ -816,13 +900,22 @@ func (e *encoder) writeVectorF32(v reflect.Value) error {
 		}
 		return nil
 	}
-	// A named element type (e.g. []Celsius): reflect only exposes the
-	// elements as float64. The round trip through float64 is exact for
-	// every value except signaling NaNs, which hardware may quiet.
+	// A named element type (e.g. []Celsius). reflect exposes the elements
+	// as float64, and converting a signaling NaN to float64 quiets it, so
+	// read each element through a *float32 instead.
 	for i := 0; i < n; i++ {
-		e.buf = binary.LittleEndian.AppendUint32(e.buf, math.Float32bits(float32(v.Index(i).Float())))
+		x := *float32At(v.Index(i))
+		e.buf = binary.LittleEndian.AppendUint32(e.buf, math.Float32bits(x))
 	}
 	return nil
+}
+
+var float32PtrType = reflect.TypeFor[*float32]()
+
+// float32At returns a pointer to v, an addressable value of a type whose
+// underlying type is float32.
+func float32At(v reflect.Value) *float32 {
+	return v.Addr().Convert(float32PtrType).Interface().(*float32)
 }
 
 // addressable returns v, or an addressable copy of v.

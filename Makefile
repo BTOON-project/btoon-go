@@ -33,9 +33,11 @@ fmt:
 fmt-check:
 	@out="$$(gofmt -l .)"; if [ -n "$$out" ]; then echo "files need gofmt:"; echo "$$out"; exit 1; fi
 
-## fuzz: fuzz the decoder (FUZZTIME=60s by default)
+## fuzz: fuzz the decoder and the LZ4 block decoder (FUZZTIME=60s each by default)
 fuzz:
 	$(GO) test -run='^$$' -fuzz=FuzzDecode -fuzztime=$(FUZZTIME) .
+	$(GO) test -run='^$$' -fuzz=FuzzLZ4Block -fuzztime=$(FUZZTIME) ./codecs
+	$(GO) test -run='^$$' -fuzz=FuzzLZ4RoundTrip -fuzztime=$(FUZZTIME) ./codecs
 
 ## bench: run the benchmarks
 bench:

@@ -1,5 +1,90 @@
 # Changelog
 
+## 0.3.0 (2026-11-14)
+
+Implements BTOON spec 0.3 (`SpecVersion` is now `"0.3"`). The wire format is
+unchanged. LZ4 envelopes are checked as SPEC §6 now requires, and the remaining
+findings of the 2026-11-13 review for this library are fixed. Some of the fixes change
+what `Marshal` writes for Go types with marshaling methods; they are marked
+**behavior change**.
+
+- **Changed: an LZ4 block must be valid under the block format, end-of-block
+  conditions included** (SPEC §6). It ends with a sequence of literals only, its last 5
+  bytes of output are literals, its last match starts at least 12 bytes before the end,
+  and no match offset is 0 or reaches back before the start of the output; the
+  match-length bits of the final token are ignored. A block that breaks these is
+  `invalid_envelope`. The `codecs` package now decodes LZ4 blocks itself and uses
+  `pierrec/lz4` only to compress. pierrec's decoder accepted blocks that end with a
+  match, rejected valid ones whose final token has match-length bits set, and could
+  reach different verdicts by platform, since it has assembly decoders for some.
+  **Behavior change** for such crafted blocks; no compressor writes them.
+  - In a differential test against liblz4 1.11.1 (3 million generated blocks and tens
+    of millions of fuzzed ones), the verdicts and output agree, except where liblz4
+    is looser than SPEC §6. It skips the end-of-block checks for a short match it copies
+    on its fast path, which a sequence can take while at least 32 bytes of output
+    remain, and it decodes a match with offset 0 as zeros. A decoder built on liblz4,
+    such as btoon-core's, needs a check of its own.
+- **Fixed (crash):** `Marshal` panicked on an `omitzero` interface field that holds a
+  nil pointer, when the pointer's type has an `IsZero` method. Such a field is zero, as
+  in encoding/json.
+- **Fixed (crash):** `Unmarshal` panicked, as encoding/json does, on an embedded pointer
+  to an unexported struct type that has a tag (``*inner `btoon:"in"` ``) when it had to
+  allocate the pointer or set it to nil. That is now `invalid_argument`. `Marshal` and
+  `Unmarshal` also panicked when such a field's type has an `IsZero` or `UnmarshalBinary`
+  method, which reflection can't call; the field is now encoded and decoded by its kind.
+- **Changed: methods with a pointer receiver are used whether or not the value is
+  addressable.** `Marshal` called a `MarshalBinary` method with a pointer receiver only
+  on addressable values, so a value encoded one way by pointer or in a slice, and another
+  way by value or in a map. It now calls the method on a copy, as encoding/json/v2 does.
+  **Behavior change** for values that aren't addressable, such as map values or a value
+  passed to `Marshal` directly, of such types: they now encode as binary instead of by
+  their kind.
+- **Changed: methods promoted from an embedded field follow encoding/json's rule,** now
+  documented. A struct that embeds a type with `MarshalBinary` encodes as that method's
+  result, without its other fields.
+  - A struct that embeds `time.Time` gets `time.Time`'s `MarshalBinary` too, and so
+    encoded as Go's private binary format. It now encodes as the embedded time, a
+    timestamp, or nil for a nil `*time.Time`, much as encoding/json writes it as the
+    time's JSON. `Unmarshal` stores timestamps, dates and datetimes in the embedded time.
+    The same holds for an embedded `big.Int` and integers.
+  - A struct that declares a method of its own with a different result is still encoded
+    with it.
+  - **Behavior change:** such structs encoded as binary (`time.Time`, when addressable)
+    or as `{}` (`big.Int`). The binary that 0.2 wrote still decodes, through the
+    promoted `UnmarshalBinary`.
+- **Added: `encoding.TextMarshaler` and `encoding.TextUnmarshaler` for struct types.** A
+  struct type with `MarshalText` but no `MarshalBinary` encodes as its text, a string,
+  as in encoding/json, and `Unmarshal` passes strings to its `UnmarshalText`. A struct's
+  fields don't always hold its value: `*big.Float`, `*big.Rat` and `*regexp.Regexp`
+  encoded as `{}`. Types of other kinds keep the encoding of their kind, so `net.IP`
+  stays binary and integer enums with `MarshalText` stay integers. A struct that gets
+  `MarshalText` from an embedded field, such as one that embeds `net.IP`, is still a map
+  of its fields. **Behavior change** for struct types with `MarshalText` and exported
+  fields, which encoded as a map of those fields.
+- **Fixed:** a float32 vector of a named element type (`[]Celsius`) keeps every bit of
+  its elements, signaling NaNs included, as SPEC §5.5 requires. `Marshal` and
+  `Unmarshal` converted the elements through float64, which quiets them. `Unmarshal`
+  into a `[N]float32` array did too.
+- **Fixed (denial of service): each document of a stream is bounded.** `Decoder`
+  buffered a document of any size before decoding it, so a peer could make it buffer
+  gigabytes. A stream document can now take at most `MaxDecompressedSize` bytes (64 MiB
+  by default), as in btoon-core's `StreamDecoder`, and `Decoder` stops reading a
+  document once it can tell that the document has more than `MaxValues` values. Either
+  fails with `size_limit`. After that, or after a reader error inside a document,
+  `Decode` returns the same error every time, since the decoder has lost its place in
+  the stream. **Behavior change** for stream documents over 64 MiB, which need a larger
+  `MaxDecompressedSize`.
+- **Tests:**
+  - The vendored conformance vectors are spec 0.3's (311).
+  - The harness moved to `internal/conformance`. The `codecs` tests run all 311 vectors
+    with every codec registered; package `btoon`'s tests skip the eleven that need one.
+  - Canonical vectors also re-encode byte for byte from what `Decode` returns with
+    `PreserveTimeTypes`, which covers the new date, datetime and table vectors
+    (SPEC §10).
+  - New fuzz targets for the LZ4 decoder, `FuzzLZ4Block` and `FuzzLZ4RoundTrip`. CI
+    runs `FuzzLZ4Block`, and `make fuzz` runs all three.
+  - `TestIntegersIgnoreGoType` no longer truncates 2^32 to a 32-bit `uint` on 386.
+
 ## 0.2.0 (2026-11-14)
 
 Implements BTOON spec 0.2 (`SpecVersion` is now `"0.2"`; decisions D23–D26 in the

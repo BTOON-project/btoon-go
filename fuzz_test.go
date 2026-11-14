@@ -25,7 +25,7 @@ var knownCodes = map[string]bool{
 // reproduces the same (canonical) bytes.
 func FuzzDecode(f *testing.F) {
 	for _, v := range loadVectors(f).Vectors {
-		f.Add(v.bytes(f))
+		f.Add(v.Bytes(f))
 	}
 	key := []byte("btoon-conformance-key-0123456789")
 	f.Fuzz(func(t *testing.T, data []byte) {

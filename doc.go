@@ -1,6 +1,6 @@
 // Package btoon implements BTOON ("Binary TOON"), a compact, canonical,
 // MessagePack-compatible binary serialization format, as specified by
-// BTOON spec 0.2 (https://github.com/BTOON-project/btoon-core, docs/SPEC.md).
+// BTOON spec 0.3 (https://github.com/BTOON-project/btoon-core, docs/SPEC.md).
 //
 // BTOON is MessagePack with string map keys, plus a columnar ("tabular")
 // encoding for arrays of uniform records, extension types for timestamps,
@@ -20,8 +20,10 @@
 // the size rule of SPEC §5.6.2 says so, and timestamps in the MessagePack
 // form selected by SPEC §5.1. Equal values therefore encode to identical
 // bytes in every conforming implementation. Structs are encoded through
-// their `btoon` (or, failing that, `json`) field tags; see Marshal for the
-// full mapping. MarshalWithOptions adds compression and signing.
+// their `btoon` (or, failing that, `json`) field tags, types with an
+// encoding.BinaryMarshaler method and structs with an encoding.TextMarshaler
+// method through the method; see Marshal for the full mapping. MarshalWithOptions adds compression and
+// signing.
 //
 // # Decoding
 //
@@ -54,5 +56,8 @@
 // # Streams
 //
 // Encoder and Decoder write and read a stream of concatenated bare
-// documents, such as a log file or a network connection.
+// documents, such as a log file or a network connection. Each document of a
+// stream is bounded like the payload of an envelope: at most
+// DecodeOptions.MaxDecompressedSize bytes (64 MiB by default) and
+// MaxValues values, or the Decoder fails with CodeSizeLimit.
 package btoon

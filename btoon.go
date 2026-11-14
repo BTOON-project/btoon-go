@@ -7,9 +7,9 @@ import (
 
 const (
 	// Version is the version of this library.
-	Version = "0.2.0"
+	Version = "0.3.0"
 	// SpecVersion is the version of the BTOON specification it implements.
-	SpecVersion = "0.2"
+	SpecVersion = "0.3"
 )
 
 const (
@@ -21,7 +21,8 @@ const (
 	MaxDepthLimit = 1000
 	// DefaultMaxDecompressedSize is the default limit for the uncompressed
 	// size of a compression envelope (SPEC §6, §7.1): 64 MiB. It also bounds
-	// the column-name bytes a tabular array copies into its rows.
+	// the documents of a stream and the column-name bytes a tabular array
+	// copies into its rows.
 	DefaultMaxDecompressedSize = 64 << 20
 	// DefaultMaxValues is the default limit for the number of values a
 	// document decodes to (SPEC §7.1): 2^20.
@@ -73,8 +74,9 @@ type DecodeOptions struct {
 	// than MaxDepthLimit is an error.
 	MaxDepth int
 	// MaxDecompressedSize limits the uncompressed size of a compression
-	// envelope, and the column-name bytes a tabular array copies into its
-	// rows (rows × the sum of the column names' lengths, SPEC §7.1). 0 means
+	// envelope, the size of each document a stream Decoder reads, and the
+	// column-name bytes a tabular array copies into its rows (rows × the sum
+	// of the column names' lengths, SPEC §7.1). 0 means
 	// DefaultMaxDecompressedSize. Exceeding it fails with CodeSizeLimit.
 	MaxDecompressedSize int
 	// MaxValues limits how many values a document decodes to (SPEC §7.1).
@@ -119,7 +121,25 @@ type DecodeOptions struct {
 //   - structs: map of their exported fields (see below)
 //   - time.Time: timestamp in UTC (see EncodeOptions.PreserveTimeOffset)
 //   - Timestamp, Date, DateTime, Ext: the corresponding extension
-//   - types implementing encoding.BinaryMarshaler: binary
+//   - other types implementing encoding.BinaryMarshaler: binary, from
+//     MarshalBinary
+//   - other struct types implementing encoding.TextMarshaler, such as
+//     big.Float and big.Rat: string, from MarshalText (types of other kinds
+//     are encoded by their kind)
+//
+// A type's marshaling method takes the place of its kind's mapping. Marshal
+// uses methods with a pointer receiver too, on a copy if the value isn't
+// addressable, so a value encodes the same way whether it is passed by
+// value, by pointer or inside a map. A MarshalBinary promoted from an
+// embedded field counts, as in encoding/json: a struct that embeds a type
+// with MarshalBinary encodes as that method's result, without its other
+// fields. A MarshalText promoted from an embedded field doesn't, so that a
+// struct embedding, say, net.IP keeps its fields. A struct that
+// gets its marshaling method from an embedded time.Time or big.Int encodes
+// as the embedded value, a timestamp or an integer (nil if the embedded
+// pointer is nil), where encoding/json writes the time's or the integer's
+// JSON; a struct that declares a method of its own, with a different
+// result, is encoded with that.
 //
 // Struct fields are encoded under their name, or the name given in a
 // `btoon:"name,omitempty"` tag. Without a btoon tag, the json tag is used.
@@ -230,7 +250,10 @@ func DecodeWithOptions(data []byte, o DecodeOptions) (any, error) {
 // fields; binary is stored in []byte, [N]byte (of equal length) and string;
 // strings in string and []byte; timestamps, dates and datetimes in
 // time.Time, Timestamp, Date and DateTime when the conversion is exact.
-// Types implementing encoding.BinaryUnmarshaler receive binary values.
+// Types implementing encoding.BinaryUnmarshaler receive binary values, and
+// struct types implementing encoding.TextUnmarshaler receive strings. A struct
+// that embeds a time.Time or big.Int stores timestamps or integers in it,
+// which is how Marshal writes such a struct.
 func Unmarshal(data []byte, v any) error {
 	return UnmarshalWithOptions(data, v, DecodeOptions{})
 }

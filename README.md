@@ -19,11 +19,11 @@ implementation. Decoding is **hardened** against hostile input.
 
 |                     |                                                                           |
 |---------------------|---------------------------------------------------------------------------|
-| Library version     | `0.2.0` (`btoon.Version`)                                                 |
-| Specification       | BTOON **0.2** (`btoon.SpecVersion`), [SPEC.md](https://github.com/BTOON-project/btoon-core/blob/main/docs/SPEC.md) |
+| Library version     | `0.3.0` (`btoon.Version`)                                                 |
+| Specification       | BTOON **0.3** (`btoon.SpecVersion`), [SPEC.md](https://github.com/BTOON-project/btoon-core/blob/main/docs/SPEC.md) |
 | Go                  | 1.25 or later                                                             |
 | Dependencies        | none in package `btoon` (standard library only); see [Compression](#compression) for the optional `codecs` package |
-| Conformance         | all 298 vectors of btoon-core's `btoon-vectors.json` (vendored in `testdata/`) pass; the zstd, lz4 and brotli vectors need the `codecs` package |
+| Conformance         | all 311 vectors of btoon-core's `btoon-vectors.json` (vendored in `testdata/`) pass; the eleven zstd, lz4 and brotli vectors need the `codecs` package |
 
 ## Install
 
@@ -89,9 +89,12 @@ for {
 ```
 
 Stream documents are bare: compression and signed envelopes can't be used in a stream,
-because their magic bytes are also the start of a valid document. Each document has its
-own [`MaxValues`](#limits) budget. The stream decoder buffers one document at a time,
-so bound untrusted input (for example with `io.LimitReader`).
+because their magic bytes are also the start of a valid document. The stream decoder
+buffers one document at a time, and each document is bounded like the payload of an
+envelope: at most `MaxDecompressedSize` bytes (64 MiB by default) and its own
+`MaxValues` budget (see [Limits](#limits)). A larger document fails with `size_limit`,
+and the decoder then returns that error from every call, since it can't tell where the
+next document starts.
 
 See [`examples/basic`](examples/basic/main.go) and the
 [package documentation](https://pkg.go.dev/github.com/BTOON-project/btoon-go) for more.
@@ -153,7 +156,12 @@ Encoding:
 | structs | map of the exported fields |
 | `time.Time` | timestamp, normalized to UTC (see `PreserveTimeOffset`) |
 | `btoon.Timestamp`, `btoon.Date`, `btoon.DateTime`, `btoon.Ext` | the corresponding extension |
-| `encoding.BinaryMarshaler` | binary |
+| other types with a `MarshalBinary` method (`encoding.BinaryMarshaler`) | binary |
+| other struct types with a `MarshalText` method (`encoding.TextMarshaler`), such as `big.Float` and `big.Rat` | string; types of other kinds, such as `net.IP` or an integer enum, keep their kind's mapping |
+
+A type's marshaling method replaces its kind's mapping. Methods with a pointer receiver
+are used whether or not the value is addressable (as in `encoding/json/v2`), so a value
+encodes the same way by value, by pointer or inside a map.
 
 Channels, functions and complex numbers are rejected with `invalid_argument`, as are
 `btoon.Ext` values using a type id that BTOON assigns (-1…-6, -10).
@@ -167,14 +175,26 @@ unchanged. `-` skips a field, and `omitempty` and `omitzero` work as in
 omits zero `time.Time` values). Embedded structs are flattened by the
 `encoding/json` rules.
 
+A `MarshalBinary` promoted from an embedded field counts, as in `encoding/json`: a
+struct that embeds a type with `MarshalBinary` encodes as that method's result, without
+its other fields. A promoted `MarshalText` doesn't, so a struct that embeds, say,
+`net.IP` is still a map of its fields. A struct that embeds `time.Time` (such as
+`struct{ time.Time }`, a common way to add methods to a time) or `big.Int` encodes as
+the embedded value: a timestamp or an integer, or nil if the embedded pointer is nil.
+(`encoding/json` writes the time's or the integer's JSON there.) A struct that declares
+a marshaling method of its own is encoded with it. `Unmarshal` stores a timestamp or an
+integer in the embedded value.
+
 `Unmarshal` follows `encoding/json` conventions: it allocates pointers, maps and
 embedded struct pointers as needed, leaves non-nullable values unchanged for a BTOON
 nil, and ignores unknown keys unless `DisallowUnknownFields` is set. Key matching is
 exact (case-sensitive). Integers fit into any integer type, failing with
 `type_mismatch` on overflow; integers and floats fit into float types; binary fits into
 `[]byte`, `[N]byte` of the same length, `string` and `encoding.BinaryUnmarshaler`;
-strings fit into `string` and `[]byte`; time values fit into `time.Time`, `Timestamp`,
-`Date` and `DateTime` when the conversion is exact.
+strings fit into `string`, `[]byte` and struct types with `UnmarshalText`; time values fit
+into `time.Time`, `Timestamp`, `Date` and `DateTime` when the conversion is exact.
+Float32 vectors keep every bit, signaling NaNs included, in `[]float32`, `[N]float32`
+and slices or arrays of named float32 types.
 
 ## Options
 
@@ -196,7 +216,7 @@ strings fit into `string` and `[]byte`; time values fit into `time.Time`, `Times
 |---|---|---|
 | `NonStrict` | false | SPEC §7 non-strict mode: allow trailing bytes and duplicate keys (last wins), and skip UTF-8 validation of string values. Map keys and column names must still be UTF-8, and bounds, depth, size and allocation checks still apply. |
 | `MaxDepth` | 128 | Nesting limit. A tabular array counts as two levels. At most 1000 (`btoon.MaxDepthLimit`); more is `invalid_argument`. |
-| `MaxDecompressedSize` | 64 MiB | Largest accepted `uncompressed_size` of a compression envelope, and the most column-name bytes a table may copy into its rows (rows × the names' total length). See [Limits](#limits). |
+| `MaxDecompressedSize` | 64 MiB | Largest accepted `uncompressed_size` of a compression envelope, largest document of a stream, and the most column-name bytes a table may copy into its rows (rows × the names' total length). See [Limits](#limits). |
 | `MaxValues` | 2^20 (1,048,576) | Most values a document may decode to, counting tabular rows and cells; map keys don't count. See [Limits](#limits). |
 | `DisableDecompression` | false | Reject compression envelopes (the cross-language `auto_decompress = false`). |
 | `HMACKey` | nil | Require a signed envelope and verify it before parsing. An empty non-nil key is `invalid_argument`. |
@@ -220,7 +240,8 @@ bounds that with two decode limits; exceeding either fails with `size_limit`:
   a compression envelope do.
 - A table copies its column names into every row, so rows × the names' total byte
   length must stay within `MaxDecompressedSize` (default 64 MiB), which also bounds the
-  `uncompressed_size` of a compression envelope.
+  `uncompressed_size` of a compression envelope and the size of each document of a
+  stream.
 
 With the defaults, decoding takes at most about 210 MB (a table of half a million
 one-cell rows, which 600 bytes of zlib can describe). Applications that decode large tables raise
@@ -240,7 +261,7 @@ b, err := btoon.MarshalWithOptions(v, btoon.EncodeOptions{Compress: true, Compre
 
 | Algorithm | Package used by `codecs` |
 |---|---|
-| LZ4 (block format) | `github.com/pierrec/lz4/v4` |
+| LZ4 (block format) | `github.com/pierrec/lz4/v4` to compress; the package's own decoder |
 | Zstandard | `github.com/klauspost/compress/zstd` |
 | Brotli | `github.com/andybalholm/brotli` |
 | Snappy (raw block format) | `github.com/golang/snappy` (the strict reference decoder) |
@@ -251,10 +272,15 @@ itself imports nothing outside the standard library. You can also implement the
 
 Decoders check the envelope header and the size limit before decompressing, stop at
 the declared size while decompressing, and reject payloads that are corrupt, have
-trailing bytes, or expand to more or fewer bytes than declared (`invalid_envelope`). A
-Zstandard payload must be one frame: further frames and skippable frames are rejected,
-as in btoon-core. If a codec panics, which is a bug in that codec, `Marshal` and
-`Decode` recover and return an error instead of crashing the program.
+trailing bytes, or expand to more or fewer bytes than declared (`invalid_envelope`). An
+LZ4 block must be valid under the block format, end-of-block conditions included
+(SPEC §6): it ends with a sequence of literals only, its last 5 bytes are literals, its
+last match starts at least 12 bytes before the end, and no match offset is 0 or reaches
+back before the start of the output. The `codecs` package decodes LZ4 itself so that
+these verdicts are exact on every platform. A Zstandard payload must be one frame: further
+frames and skippable frames are rejected, as in btoon-core. If a codec panics, which is
+a bug in that codec, `Marshal` and `Decode` recover and return an error instead of
+crashing the program.
 
 ## Errors
 
@@ -294,16 +320,18 @@ the target type). There is a `Code…` constant and an `Err…` sentinel for eac
 
 `testdata/btoon-vectors.json` is a verbatim copy of btoon-core's conformance vectors;
 `make sync-vectors` refreshes it from `../btoon-core` (override with `CORE=path`). The
-conformance test decodes every valid vector and compares it with its typed value,
-re-encodes every canonical vector byte for byte, and checks that every invalid vector
-fails with the expected code. Without the `codecs` package three vectors (zstd, lz4,
-brotli) are skipped; the `codecs` tests decode them.
+conformance test (in [`internal/conformance`](internal/conformance/conformance.go))
+decodes every valid vector and compares it with its typed value, re-encodes every
+canonical vector byte for byte, both from its typed value and from what `Decode` returns
+with `PreserveTimeTypes`, and checks that every invalid vector fails with the expected
+code. Package `btoon`'s tests skip the eleven vectors that need an optional codec; the
+`codecs` tests run all 311.
 
 ```sh
 make test         # go test -race ./...  (unit tests + conformance vectors)
 make vet          # go vet ./...
 make fmt-check    # gofmt -l
-make fuzz         # native Go fuzzing of the decoder, FUZZTIME=60s
+make fuzz         # native Go fuzzing of the decoders, FUZZTIME=60s each
 make bench        # benchmarks
 make example      # go run ./examples/basic
 make sync-vectors # copy ../btoon-core/tests/vectors/btoon-vectors.json
@@ -314,6 +342,8 @@ so a new advisory for a codec dependency fails the build.
 
 `FuzzDecode` checks that decoding never panics, that all failures carry a SPEC §7 code,
 and that decode → encode → decode returns an equal value whose encoding is stable.
+`FuzzLZ4Block` checks the LZ4 decoder against a plain statement of SPEC §6's rules, and
+`FuzzLZ4RoundTrip` checks that it decodes every block the LZ4 compressor writes.
 
 ## Benchmarks
 
