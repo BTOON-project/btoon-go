@@ -5,6 +5,7 @@ import (
 	"errors"
 	"io"
 	"reflect"
+	"strconv"
 	"strings"
 	"testing"
 	"testing/iotest"
@@ -125,20 +126,25 @@ func TestStreamTypedAndErrors(t *testing.T) {
 }
 
 // A stream reports the same result as Decode for every bare conformance
-// vector, with the vector's options.
+// vector, with the vector's options, except that a stream document can't
+// be larger than MaxDecompressedSize.
 func TestStreamMatchesDecode(t *testing.T) {
 	f := loadVectors(t)
 	for _, v := range f.Vectors {
-		data := v.bytes(t)
+		data := v.Bytes(t)
 		if len(data) == 0 || bytes.HasPrefix(data, []byte("BTON")) || bytes.HasPrefix(data, []byte("BTSG")) || v.Error == btoon.CodeTrailingData || v.Options.HMACKey != nil {
 			continue
 		}
-		opts := v.decodeOptions(t, f)
+		opts := v.DecodeOptions(t, f)
 		dec := btoon.NewDecoder(bytes.NewReader(data))
 		dec.SetOptions(opts)
 		var got any
 		err := dec.Decode(&got)
 		want, wantErr := btoon.DecodeWithOptions(data, opts)
+		if len(data) > opts.MaxDecompressedSize && wantErr == nil {
+			wantErrCode(t, err, btoon.CodeSizeLimit)
+			continue
+		}
 		if (err == nil) != (wantErr == nil) {
 			t.Fatalf("%s: stream %v, Decode %v", v.ID, err, wantErr)
 		}
@@ -156,6 +162,155 @@ func TestStreamMatchesDecode(t *testing.T) {
 		}
 		if err := dec.Decode(&got); err != io.EOF {
 			t.Fatalf("%s: want io.EOF after the document, got %v", v.ID, err)
+		}
+	}
+}
+
+// endless serves a document that never ends, as a peer that keeps sending
+// would: an array32 header announcing 2^32-1 elements, then nils. n counts
+// the bytes read.
+type endless struct {
+	prefix []byte
+	n      int
+}
+
+func (e *endless) Read(p []byte) (int, error) {
+	for i := range p {
+		if e.n < len(e.prefix) {
+			p[i] = e.prefix[e.n]
+		} else {
+			p[i] = 0xc0
+		}
+		e.n++
+	}
+	return len(p), nil
+}
+
+// Each document of a stream is bounded by MaxDecompressedSize and MaxValues,
+// as in btoon-core's StreamDecoder. The Decoder used to buffer a document of
+// any size before decoding it (review 2026-11-13).
+func TestStreamDocumentLimits(t *testing.T) {
+	const slack = 128 << 10 // what the Decoder may read ahead
+	var x any
+
+	// The byte limit, with a value limit that doesn't apply first.
+	src := &endless{prefix: fromHex(t, "ddffffffff")}
+	dec := btoon.NewDecoder(src)
+	dec.SetOptions(btoon.DecodeOptions{MaxDecompressedSize: 1 << 20, MaxValues: 1 << 30})
+	wantErrCode(t, dec.Decode(&x), btoon.CodeSizeLimit)
+	if src.n > 1<<20+slack {
+		t.Fatalf("read %d bytes for a 1 MiB limit", src.n)
+	}
+	// The Decoder can't tell where the next document starts, so the error
+	// sticks, and it reads no more.
+	read := src.n
+	wantErrCode(t, dec.Decode(&x), btoon.CodeSizeLimit)
+	if src.n != read {
+		t.Fatalf("read on after the error")
+	}
+
+	// With the defaults, the value limit stops it after about 2^21 nils.
+	src = &endless{prefix: fromHex(t, "ddffffffff")}
+	dec = btoon.NewDecoder(src)
+	wantErrCode(t, dec.Decode(&x), btoon.CodeSizeLimit)
+	if src.n > 2<<20+slack {
+		t.Fatalf("read %d bytes for 2^20 values", src.n)
+	}
+
+	// A string longer than the limit fails before its bytes are buffered.
+	src = &endless{prefix: fromHex(t, "db00200000")} // 2 MiB
+	dec = btoon.NewDecoder(src)
+	dec.SetOptions(btoon.DecodeOptions{MaxDecompressedSize: 1 << 20})
+	wantErrCode(t, dec.Decode(&x), btoon.CodeSizeLimit)
+	if src.n > 1<<20+slack {
+		t.Fatalf("read %d bytes for a 1 MiB limit", src.n)
+	}
+
+	// An error that Decode finds in the bytes before the limit is reported
+	// instead: here an invalid string, then a string of 2 MiB.
+	src = &endless{prefix: fromHex(t, "92a1ffdb00200000")}
+	dec = btoon.NewDecoder(src)
+	dec.SetOptions(btoon.DecodeOptions{MaxDecompressedSize: 1 << 10})
+	wantErrCode(t, dec.Decode(&x), btoon.CodeInvalidUTF8)
+
+	// A document of exactly the limit decodes, and so does the next one. A
+	// stream that ends inside a document over the limit is truncated, as for
+	// Decode.
+	doc := mustMarshal(t, strings.Repeat("x", 1000))
+	two := append(append([]byte{}, doc...), 0x2a)
+	dec = btoon.NewDecoder(bytes.NewReader(two))
+	dec.SetOptions(btoon.DecodeOptions{MaxDecompressedSize: len(doc)})
+	if err := dec.Decode(&x); err != nil || x != strings.Repeat("x", 1000) {
+		t.Fatalf("document at the limit: %v", err)
+	}
+	if err := dec.Decode(&x); err != nil || x != int64(42) {
+		t.Fatalf("next document: %v %v", x, err)
+	}
+	dec = btoon.NewDecoder(bytes.NewReader(doc[:len(doc)-1]))
+	dec.SetOptions(btoon.DecodeOptions{MaxDecompressedSize: len(doc) - 1})
+	wantErrCode(t, dec.Decode(&x), btoon.CodeTruncated)
+	dec = btoon.NewDecoder(bytes.NewReader(doc))
+	dec.SetOptions(btoon.DecodeOptions{MaxDecompressedSize: len(doc) - 1})
+	wantErrCode(t, dec.Decode(&x), btoon.CodeSizeLimit)
+
+	// A map's keys don't count as values: 600,000 entries are 1.2 million
+	// items but 600,001 values, under the default limit.
+	m := make(map[string]any, 600_000)
+	for i := range 600_000 {
+		m[strconv.Itoa(i)] = nil
+	}
+	dec = btoon.NewDecoder(bytes.NewReader(mustMarshal(t, m)))
+	if err := dec.Decode(&x); err != nil {
+		t.Fatalf("map of 600,000 entries: %v", err)
+	}
+}
+
+// flaky returns err once, after the first n bytes of data.
+type flaky struct {
+	data []byte
+	n    int
+	err  error
+}
+
+func (f *flaky) Read(p []byte) (int, error) {
+	if f.n == 0 && f.err != nil {
+		err := f.err
+		f.err = nil
+		return 0, err
+	}
+	if len(f.data) == 0 {
+		return 0, io.EOF
+	}
+	k := len(p)
+	if f.err != nil {
+		k = min(k, f.n)
+	}
+	k = copy(p, f.data[:min(k, len(f.data))])
+	f.data, f.n = f.data[k:], f.n-k
+	return k, nil
+}
+
+// A reader error between documents can be retried, but one inside a
+// document leaves the Decoder without its place in the stream, so it
+// returns that error from then on.
+func TestStreamReaderErrors(t *testing.T) {
+	timeout := errors.New("timeout")
+	var x any
+	dec := btoon.NewDecoder(&flaky{data: fromHex(t, "0102"), n: 1, err: timeout})
+	if err := dec.Decode(&x); err != nil || x != int64(1) {
+		t.Fatalf("first document: %v %v", x, err)
+	}
+	if err := dec.Decode(&x); err != timeout {
+		t.Fatalf("want the reader's error, got %v", err)
+	}
+	if err := dec.Decode(&x); err != nil || x != int64(2) {
+		t.Fatalf("after a retry: %v %v", x, err)
+	}
+
+	dec = btoon.NewDecoder(&flaky{data: fromHex(t, "92010203"), n: 2, err: timeout})
+	for range 2 {
+		if err := dec.Decode(&x); err != timeout {
+			t.Fatalf("want the reader's error, got %v", err)
 		}
 	}
 }

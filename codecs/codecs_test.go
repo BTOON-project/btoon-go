@@ -3,17 +3,15 @@ package codecs_test
 import (
 	"bytes"
 	"encoding/binary"
-	"encoding/hex"
-	"encoding/json"
 	"errors"
 	"fmt"
-	"os"
 	"reflect"
 	"slices"
 	"testing"
 
 	btoon "github.com/BTOON-project/btoon-go"
 	"github.com/BTOON-project/btoon-go/codecs"
+	"github.com/BTOON-project/btoon-go/internal/conformance"
 )
 
 var all = []struct {
@@ -27,60 +25,11 @@ var all = []struct {
 	{"snappy", btoon.Snappy, codecs.Snappy},
 }
 
-// TestRequiresVectors decodes the conformance vectors that need an optional
-// codec. They hold the same document as compression/zlib, which the root
-// package's conformance test checks against its typed value.
-func TestRequiresVectors(t *testing.T) {
-	raw, err := os.ReadFile("../testdata/btoon-vectors.json")
-	if err != nil {
-		t.Fatal(err)
-	}
-	var f struct {
-		Vectors []struct {
-			ID       string `json:"id"`
-			Hex      string `json:"hex"`
-			Requires string `json:"requires"`
-		} `json:"vectors"`
-	}
-	if err := json.Unmarshal(raw, &f); err != nil {
-		t.Fatal(err)
-	}
-	decode := func(h string) any {
-		t.Helper()
-		b, err := hex.DecodeString(h)
-		if err != nil {
-			t.Fatal(err)
-		}
-		v, err := btoon.Decode(b)
-		if err != nil {
-			t.Fatalf("decode: %v", err)
-		}
-		return v
-	}
-	var want any
-	for _, v := range f.Vectors {
-		if v.ID == "compression/zlib" {
-			want = decode(v.Hex)
-		}
-	}
-	if want == nil {
-		t.Fatal("compression/zlib vector not found")
-	}
-	n := 0
-	for _, v := range f.Vectors {
-		if v.Requires == "" {
-			continue
-		}
-		t.Run(v.ID, func(t *testing.T) {
-			if got := decode(v.Hex); !reflect.DeepEqual(got, want) {
-				t.Fatalf("decoded %#v, want %#v", got, want)
-			}
-		})
-		n++
-	}
-	if n != 3 {
-		t.Fatalf("found %d vectors with requires, want 3", n)
-	}
+// TestConformanceVectors runs every conformance vector with all the codecs
+// registered. Package btoon's tests skip the vectors that need a codec; here
+// none may be skipped.
+func TestConformanceVectors(t *testing.T) {
+	conformance.Run(t, conformance.Load(t, "../testdata/btoon-vectors.json"), true)
 }
 
 func sampleDoc() map[string]any {

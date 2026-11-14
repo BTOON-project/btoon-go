@@ -6,14 +6,20 @@
 //
 //	import _ "github.com/BTOON-project/btoon-go/codecs"
 //
-// The codecs use github.com/pierrec/lz4/v4, github.com/klauspost/compress
-// (zstd), github.com/andybalholm/brotli and github.com/golang/snappy, all
-// without cgo. Package btoon itself has no third-party dependencies.
+// The codecs use github.com/pierrec/lz4/v4 (to compress),
+// github.com/klauspost/compress (zstd), github.com/andybalholm/brotli and
+// github.com/golang/snappy, all without cgo. LZ4 blocks are decompressed by
+// this package's own decoder. Package btoon itself has no third-party
+// dependencies.
 //
 // Every decompressor stops at the size declared by the envelope (which
 // btoon has already checked against DecodeOptions.MaxDecompressedSize) and
-// fails unless the payload expands to exactly that size. A Zstandard
-// payload must be a single frame, with no skippable frames.
+// fails unless the payload expands to exactly that size. An LZ4 block must
+// be valid under the block format, end-of-block conditions included
+// (SPEC §6): it ends with a sequence of literals only, its last 5 bytes are
+// literals, its last match starts at least 12 bytes before the end, and no
+// match offset is 0 or reaches back before the start of the output. A
+// Zstandard payload must be a single frame, with no skippable frames.
 package codecs
 
 import (
@@ -76,21 +82,12 @@ func (lz4Codec) Compress(src []byte, level int) ([]byte, error) {
 	return dst[:n], nil
 }
 
+// Decompress uses this package's own block decoder rather than
+// pierrec/lz4's, which accepts blocks that break the block format's
+// end-of-block conditions and rejects some that liblz4 accepts. See
+// decodeLZ4Block.
 func (lz4Codec) Decompress(src []byte, size int) ([]byte, error) {
-	// An LZ4 block expands at most about 255x, so larger claims are
-	// impossible; rejecting them avoids allocating for a lying header.
-	if uint64(size) > uint64(len(src))*255+16 {
-		return nil, fmt.Errorf("lz4: %d bytes cannot expand to %d", len(src), size)
-	}
-	dst := make([]byte, size)
-	n, err := lz4.UncompressBlock(src, dst)
-	if err != nil {
-		return nil, err
-	}
-	if n != size {
-		return nil, errSize
-	}
-	return dst, nil
+	return decodeLZ4Block(src, size)
 }
 
 // --- Zstandard (RFC 8878 frame) --------------------------------------------------------

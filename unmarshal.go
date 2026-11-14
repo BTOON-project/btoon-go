@@ -106,6 +106,12 @@ func (a *assigner) assign(dst reflect.Value, src any) error {
 	if src == nil {
 		switch dst.Kind() {
 		case reflect.Interface, reflect.Pointer, reflect.Map, reflect.Slice:
+			if dst.IsZero() {
+				return nil
+			}
+			if !dst.CanSet() {
+				return a.unsettable(dst)
+			}
 			dst.SetZero()
 		}
 		return nil
@@ -114,6 +120,9 @@ func (a *assigner) assign(dst reflect.Value, src any) error {
 	switch dst.Kind() {
 	case reflect.Pointer:
 		if dst.IsNil() {
+			if !dst.CanSet() {
+				return a.unsettable(dst)
+			}
 			dst.Set(reflect.New(dst.Type().Elem()))
 		}
 		return a.assign(dst.Elem(), src)
@@ -161,14 +170,34 @@ func (a *assigner) assign(dst reflect.Value, src any) error {
 		return nil
 	}
 
-	if ti.addrUnmarshaler {
-		if b, ok := src.([]byte); ok {
-			u := dst.Addr().Interface().(encoding.BinaryUnmarshaler)
-			if err := u.UnmarshalBinary(b); err != nil {
-				return wrapError(CodeTypeMismatch, "UnmarshalBinary of "+dst.Type().String()+" failed"+a.location(), err)
+	// Methods receive the values Marshal writes with them: binary for
+	// UnmarshalBinary and strings for UnmarshalText.
+	if canCallMethods(dst) {
+		switch s := src.(type) {
+		case []byte:
+			if ti.unmarshalBinary {
+				if err := dst.Addr().Interface().(encoding.BinaryUnmarshaler).UnmarshalBinary(s); err != nil {
+					return wrapError(CodeTypeMismatch, "UnmarshalBinary of "+dst.Type().String()+" failed"+a.location(), err)
+				}
+				return nil
 			}
-			return nil
+		case string:
+			if ti.unmarshalText {
+				if err := dst.Addr().Interface().(encoding.TextUnmarshaler).UnmarshalText([]byte(s)); err != nil {
+					return wrapError(CodeTypeMismatch, "UnmarshalText of "+dst.Type().String()+" failed"+a.location(), err)
+				}
+				return nil
+			}
 		}
+	}
+	// A struct that embeds a time.Time or big.Int, which Marshal writes as
+	// that value, stores a timestamp or an integer in it.
+	if ti.native != specialNone && isNativeSource(ti.native, src) {
+		fv, err := fieldByIndexAlloc(dst, ti.nativeIndex)
+		if err != nil {
+			return newError(CodeInvalidArgument, err.Error()+a.location())
+		}
+		return a.assign(fv, src)
 	}
 
 	switch dst.Kind() {
@@ -325,7 +354,7 @@ func (a *assigner) assignSlice(dst reflect.Value, src any) error {
 		if ek == reflect.Float32 || ek == reflect.Float64 {
 			out := reflect.MakeSlice(t, len(s), len(s))
 			for i, x := range s {
-				out.Index(i).SetFloat(float64(x))
+				setFloat32(out.Index(i), x)
 			}
 			dst.Set(out)
 			return nil
@@ -344,6 +373,18 @@ func (a *assigner) assignSlice(dst reflect.Value, src any) error {
 		}
 	}
 	return a.mismatch(src, t, "")
+}
+
+// setFloat32 stores an element of a float32 vector in v, an addressable
+// float. An element of a float32 kind keeps its bits, signaling NaNs
+// included (SPEC §5.5), which SetFloat's conversion through float64 would
+// quiet.
+func setFloat32(v reflect.Value, x float32) {
+	if v.Kind() == reflect.Float32 {
+		*float32At(v) = x
+		return
+	}
+	v.SetFloat(float64(x))
 }
 
 func (a *assigner) assignArray(dst reflect.Value, src any) error {
@@ -380,7 +421,7 @@ func (a *assigner) assignArray(dst reflect.Value, src any) error {
 	case []float32:
 		if (ek == reflect.Float32 || ek == reflect.Float64) && len(s) == n {
 			for i, x := range s {
-				dst.Index(i).SetFloat(float64(x))
+				setFloat32(dst.Index(i), x)
 			}
 			return nil
 		}
@@ -490,6 +531,25 @@ func fieldByIndexAlloc(v reflect.Value, index []int) (reflect.Value, error) {
 		v = v.Field(x)
 	}
 	return v, nil
+}
+
+// unsettable reports a value that Unmarshal would have to set but can't:
+// an embedded field of an unexported type that has a tag, which reflection
+// doesn't let it set. encoding/json panics there.
+func (a *assigner) unsettable(dst reflect.Value) error {
+	return newError(CodeInvalidArgument, "cannot set embedded field of unexported type "+dst.Type().String()+a.location())
+}
+
+// isNativeSource reports whether src is a decoded value that a time.Time
+// (kind specialTime) or a big.Int (specialBigInt) can hold.
+func isNativeSource(kind special, src any) bool {
+	switch src.(type) {
+	case time.Time, Timestamp, Date, DateTime:
+		return kind == specialTime
+	case int64, uint64, *big.Int:
+		return kind == specialBigInt
+	}
+	return false
 }
 
 type typeError struct{ msg string }

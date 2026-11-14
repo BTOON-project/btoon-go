@@ -12,6 +12,7 @@ import (
 	"time"
 
 	btoon "github.com/BTOON-project/btoon-go"
+	"github.com/BTOON-project/btoon-go/internal/conformance"
 )
 
 func mustMarshal(t *testing.T, v any) []byte {
@@ -50,11 +51,11 @@ func TestIntegersIgnoreGoType(t *testing.T) {
 		if !v.Canonical || v.Error != "" {
 			continue
 		}
-		tv, err := parseTyped(v.Value)
-		if err != nil || tv.kind != "int" {
+		tv, err := conformance.ParseTyped(v.Value)
+		if err != nil || tv.Kind != "int" {
 			continue
 		}
-		x := tv.bigInt()
+		x := tv.BigInt()
 		var reprs []any
 		reprs = append(reprs, x, *x)
 		if x.IsInt64() {
@@ -72,7 +73,14 @@ func TestIntegersIgnoreGoType(t *testing.T) {
 		}
 		if x.Sign() >= 0 && x.IsUint64() {
 			u := x.Uint64()
-			reprs = append(reprs, u, uintptr(u), uint(u))
+			reprs = append(reprs, u)
+			// uint and uintptr have 32 bits on 32-bit platforms.
+			if u <= math.MaxUint {
+				reprs = append(reprs, uint(u))
+			}
+			if uint64(uintptr(u)) == u {
+				reprs = append(reprs, uintptr(u))
+			}
 			if u <= math.MaxUint32 {
 				reprs = append(reprs, uint32(u))
 			}
@@ -200,6 +208,40 @@ func TestBinaryAndVectors(t *testing.T) {
 	wantHex(t, btoon.VectorF64{math.Float64frombits(0x7ff8000000000001)}, "d7fa010000000000f87f")
 	// A plain []float64 is an array of floats.
 	wantHex(t, []float64{1.5}, "91cb3ff8000000000000")
+}
+
+// A float32 vector keeps every bit of its elements, signaling NaNs
+// included (SPEC §5.5), whatever the element type is called. Elements of a
+// named type used to go through float64, which quiets them, in both
+// directions (review 2026-11-13).
+func TestFloat32VectorsKeepSignalingNaNs(t *testing.T) {
+	type celsius float32
+	snan := math.Float32frombits(0x7f800001)
+	const doc = "d6fb0100807f"
+	wantHex(t, []float32{snan}, doc)
+	wantHex(t, []celsius{celsius(snan)}, doc)
+	wantHex(t, [1]celsius{celsius(snan)}, doc)
+	wantHex(t, map[string][]celsius{"v": {celsius(snan)}}, "81a176"+doc)
+
+	data := fromHex(t, doc)
+	check := func(name string, x float32, err error) {
+		t.Helper()
+		if err != nil || math.Float32bits(x) != 0x7f800001 {
+			t.Fatalf("%s: got %#08x, %v", name, math.Float32bits(x), err)
+		}
+	}
+	var s32 []float32
+	err := btoon.Unmarshal(data, &s32)
+	check("[]float32", s32[0], err)
+	var sc []celsius
+	err = btoon.Unmarshal(data, &sc)
+	check("[]celsius", float32(sc[0]), err)
+	var a32 [1]float32
+	err = btoon.Unmarshal(data, &a32)
+	check("[1]float32", a32[0], err)
+	var ac [1]celsius
+	err = btoon.Unmarshal(data, &ac)
+	check("[1]celsius", float32(ac[0]), err)
 }
 
 func TestExt(t *testing.T) {

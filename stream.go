@@ -42,22 +42,31 @@ func (e *Encoder) Encode(v any) error {
 // A Decoder reads a stream of concatenated bare BTOON documents, as written
 // by Encoder.
 //
-// Each document is buffered in full before it is decoded, so memory use is
-// proportional to the largest document. When reading from an untrusted
-// source, bound the input (for example with io.LimitReader).
+// Each document is buffered in full before it is decoded, and the options
+// bound it, as btoon-core's StreamDecoder does: a document can take at most
+// DecodeOptions.MaxDecompressedSize bytes (64 MiB by default) and decode to
+// at most MaxValues values (2^20 by default). A document over either limit
+// fails with CodeSizeLimit as soon as the Decoder has read enough of it to
+// tell, so memory use stays below the byte limit whatever the source sends.
 type Decoder struct {
 	r    *bufio.Reader
 	opts DecodeOptions
 	buf  []byte
+	// maxBytes is the size limit of the document being read.
+	maxBytes uint64
+	// err is returned by every Decode after a document went over a limit or
+	// the reader failed inside one: the Decoder doesn't know where the next
+	// document starts.
+	err error
 }
 
 // NewDecoder returns a Decoder that reads from r. It buffers its input, so
 // it may read beyond the documents it has returned.
 func NewDecoder(r io.Reader) *Decoder { return &Decoder{r: bufio.NewReader(r)} }
 
-// SetOptions sets the options used by subsequent calls to Decode.
-// HMACKey must be nil, and the envelope options have no effect, because
-// stream documents are bare.
+// SetOptions sets the options used by subsequent calls to Decode. Stream
+// documents are bare, so HMACKey must be nil and DisableDecompression has no
+// effect; MaxDecompressedSize bounds the size of each document.
 func (d *Decoder) SetOptions(o DecodeOptions) { d.opts = o }
 
 // More reports whether there is another document in the stream.
@@ -68,10 +77,14 @@ func (d *Decoder) More() bool {
 
 // Decode reads the next document and stores it in the value pointed to by
 // v, as Unmarshal would; v may also be a pointer to an interface value to
-// get the dynamic value. At the end of the stream Decode returns io.EOF. A
-// stream that ends inside a document fails as Decode fails on the bytes it
-// holds: with CodeTruncated, unless the decoder finds an error first, such
-// as a value past MaxValues (SPEC §7.1).
+// get the dynamic value. At the end of the stream Decode returns io.EOF.
+//
+// A stream that ends inside a document fails as Decode fails on the bytes
+// it holds: with CodeTruncated, unless the decoder finds an error first,
+// such as a value past MaxValues (SPEC §7.1). A document over the limits
+// (see Decoder) fails with CodeSizeLimit, unless the decoder finds an error
+// in the bytes before; after that, and after a reader error inside a
+// document, Decode returns the same error every time.
 func (d *Decoder) Decode(v any) error {
 	rv := reflect.ValueOf(v)
 	if rv.Kind() != reflect.Pointer || rv.IsNil() {
@@ -84,17 +97,32 @@ func (d *Decoder) Decode(v any) error {
 	if err != nil {
 		return err
 	}
-	doc, err := d.next()
+	if d.err != nil {
+		return d.err
+	}
+	doc, err := d.next(&cfg)
 	if err != nil {
 		var be *Error
-		if !errors.As(err, &be) || be.Code != CodeTruncated {
+		if !errors.As(err, &be) || (be.Code != CodeTruncated && be.Code != CodeSizeLimit) {
+			// io.EOF, or the reader failed. Inside a document, the Decoder
+			// has lost its place in the stream.
+			if err != io.EOF && len(d.buf) > 0 {
+				d.err = err
+			}
 			return err
 		}
-		// The stream ended inside a document. Report what Decode reports
-		// for the same bytes: the decoder may find an error before the end,
-		// or count a value past MaxValues as the input ends (SPEC §7.1).
+		// The stream ended inside a document, or the document went over a
+		// limit. Report what Decode reports for the same bytes if it finds
+		// an error first: an invalid value, or a value counted past
+		// MaxValues as the input ends (SPEC §7.1).
 		if _, derr := cfg.decodeBare(d.buf, false); derr != nil {
-			return derr
+			var de *Error
+			if !errors.As(derr, &de) || de.Code != CodeTruncated {
+				err = derr
+			}
+		}
+		if be.Code == CodeSizeLimit {
+			d.err = err
 		}
 		return err
 	}
@@ -110,9 +138,23 @@ func (d *Decoder) Decode(v any) error {
 // of the MessagePack layer (headers and lengths, with extensions as opaque
 // payloads) and leaves all validation to the decoder, so that a stream
 // reports the same errors as Decode would for the same bytes.
-func (d *Decoder) next() ([]byte, error) {
+//
+// It enforces the document limits as it goes, never buffering more than
+// MaxDecompressedSize bytes. It also counts the items it frames: values and
+// map keys, which Decode doesn't count. A map has as many keys as values, so
+// a document of more than 2 × MaxValues items decodes to more than MaxValues
+// values, and Decode would fail on it too.
+func (d *Decoder) next(cfg *decodeConfig) ([]byte, error) {
 	d.buf = d.buf[:0]
+	d.maxBytes = uint64(cfg.maxDecompressed)
+	items := uint64(0)
 	for pending := uint64(1); pending > 0; pending-- {
+		if items++; items > 2*uint64(cfg.maxValues) {
+			return nil, errorAt(CodeSizeLimit, "stream document decodes to more values than max_values allows", len(d.buf))
+		}
+		if uint64(len(d.buf)) >= d.maxBytes {
+			return nil, d.full()
+		}
 		m, err := d.r.ReadByte()
 		if err != nil {
 			if err == io.EOF {
@@ -198,6 +240,19 @@ func (d *Decoder) truncated() error {
 	return errorAt(CodeTruncated, "stream ends inside a document", len(d.buf))
 }
 
+// full reports a document that needs more bytes than the limit allows:
+// with CodeSizeLimit if the stream holds more, or as truncated if it ends
+// there, which is what Decode reports for the bytes buffered so far.
+func (d *Decoder) full() error {
+	if _, err := d.r.Peek(1); err != nil {
+		if err == io.EOF {
+			return d.truncated()
+		}
+		return err
+	}
+	return errorAt(CodeSizeLimit, "stream document is larger than max_decompressed_size ("+utoa(d.maxBytes)+" bytes)", len(d.buf))
+}
+
 // readLength reads a big-endian length of size bytes into the buffer.
 func (d *Decoder) readLength(size int) (uint64, error) {
 	start := len(d.buf)
@@ -219,7 +274,10 @@ func (d *Decoder) readLength(size int) (uint64, error) {
 // only as data actually arrives.
 func (d *Decoder) readN(n uint64) error {
 	for n > 0 {
-		chunk := int(min(n, 64<<10))
+		if uint64(len(d.buf)) >= d.maxBytes {
+			return d.full()
+		}
+		chunk := int(min(n, 64<<10, d.maxBytes-uint64(len(d.buf))))
 		start := len(d.buf)
 		d.buf = slices.Grow(d.buf, chunk)[:start+chunk]
 		if _, err := io.ReadFull(d.r, d.buf[start:]); err != nil {

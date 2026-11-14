@@ -88,6 +88,37 @@ func TestOmitEmptyAndOmitZero(t *testing.T) {
 	}
 }
 
+// zeroer and money model a type whose IsZero has a pointer receiver.
+type zeroer interface{ IsZero() bool }
+
+type money struct{ cents int64 }
+
+func (m *money) IsZero() bool { return m.cents == 0 }
+
+// An omitzero interface field that holds a nil pointer is zero, as in
+// encoding/json; Marshal used to call IsZero on the nil pointer and panic
+// (review 2026-11-13).
+func TestOmitZeroInterfaceHoldingNilPointer(t *testing.T) {
+	type T struct {
+		Amount zeroer `btoon:"amount,omitzero"`
+		Note   string `btoon:"note"`
+	}
+	for _, c := range []struct {
+		v    T
+		keys []string
+	}{
+		{T{Amount: (*money)(nil), Note: "x"}, []string{"note"}},
+		{T{Amount: nil, Note: "x"}, []string{"note"}},
+		{T{Amount: &money{}, Note: "x"}, []string{"note"}},
+		{T{Amount: &money{5}, Note: "x"}, []string{"amount", "note"}},
+	} {
+		got := keysOf(decodeMap(t, c.v))
+		if len(got) != len(c.keys) || !contains(got, c.keys[0]) || !contains(got, c.keys[len(c.keys)-1]) {
+			t.Fatalf("%#v: got keys %v, want %v", c.v, got, c.keys)
+		}
+	}
+}
+
 func contains(s []string, x string) bool {
 	for _, v := range s {
 		if v == x {

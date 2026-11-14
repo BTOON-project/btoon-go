@@ -309,7 +309,7 @@ func TestContainersDecodeTheSameWithoutABudget(t *testing.T) {
 	var docs [][]byte
 	for _, v := range loadVectors(t).Vectors {
 		if v.Options.HMACKey == nil && v.EncodeError == "" && !strings.HasPrefix(v.Hex, "42544f4e") && !strings.HasPrefix(v.Hex, "42545347") {
-			docs = append(docs, v.bytes(t))
+			docs = append(docs, v.Bytes(t))
 		}
 	}
 	// Containers larger than the doubling starts with, and tables with
